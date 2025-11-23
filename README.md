@@ -1,5 +1,5 @@
 ## 1. Codebase structure 
-
+```
 scHIIT/
 ├── src/
 │   ├── engines/
@@ -32,4 +32,4 @@ scHIIT/
 ├── README.md
 ├── LICENSE
 └── requirements.txt
-
+```
