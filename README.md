@@ -19,9 +19,12 @@ scHIIT/
 │       │
 │       └── schiit_method/           # scHIIT pipeline implementation
 │           ├── __init__.py
-│           ├── stage1_filter.py     # High expression & uniqueness
-│           ├── stage2_specificity.py # JSD-based specificity
-│           └── stage3_network.py    # Network-based identity core
+│           ├── network
+│           |    └── grn_base.py     # network creation for transcriptional core 
+│           ├── tf_filters
+|                ├── base_filter.py  # base filter 
+│                ├── jsd_filter.py  # GJSD based algorithm
+|                └── fast_oi_filter.py    # O information based identity TF algorithm 
 │
 ├── demo_nb/
 │   └── cellxgene_utils_demo.ipynb                   # cellxgene wrapper Usage examples
