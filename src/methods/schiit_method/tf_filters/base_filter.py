@@ -36,6 +36,7 @@ class BaseTFIdentityPipeline(ABC):
         adata: AnnData,
         tf_list: List[str],
         target_cell_type: str,
+        background_cell_type: str,
         cell_type_key: str = 'cell_type',
         scgx_sig_file: str = None,
         chipseq_file: str = None,
@@ -66,6 +67,7 @@ class BaseTFIdentityPipeline(ABC):
         self.adata = adata
         self.tf_list = tf_list
         self.target_cell_type = target_cell_type
+        self.background_cell_type = background_cell_type
         self.cell_type_key = cell_type_key
         self.verbose = verbose
         self.jsd_method = jsd_method
@@ -114,7 +116,7 @@ class BaseTFIdentityPipeline(ABC):
         """Pre-compute data needed for parallel JSD calculations."""
         # Pre-compute masks and indices
         self.target_mask = self.adata.obs[self.cell_type_key] == self.target_cell_type
-        self.other_mask = ~self.target_mask
+        self.other_mask = self.adata.obs[self.cell_type_key] == self.background_cell_type
         self.target_indices = np.where(self.target_mask)[0]
         self.other_indices = np.where(self.other_mask)[0]
         

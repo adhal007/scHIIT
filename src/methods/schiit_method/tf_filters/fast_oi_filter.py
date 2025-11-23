@@ -24,7 +24,7 @@ import networkx as nx
 from tqdm import tqdm
 import warnings
 from importlib import reload
-import src.methods.tf_filters.base_filter as tf_base
+import src.methods.schiit_method.tf_filters.base_filter as tf_base
 reload(tf_base)
 
 # ============================================================================

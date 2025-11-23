@@ -5,7 +5,7 @@ import scanpy as sc
 import networkx as nx
 import warnings
 from typing import Dict, List, Tuple, Optional
-import src.methods.tf_filters.base_filter as tf_base
+import src.methods.schiit_method.tf_filters.base_filter as tf_base
 warnings.filterwarnings('ignore')
 class CoreFilterOnlyPipeline(tf_base.BaseTFIdentityPipeline):
     """

@@ -1,5 +1,5 @@
 # specific modules
-import src.methods.tf_filters.base_filter as tf_base
+import src.methods.schiit_method.tf_filters.base_filter as tf_base
 # base packages
 import numpy as np
 import pandas as pd
