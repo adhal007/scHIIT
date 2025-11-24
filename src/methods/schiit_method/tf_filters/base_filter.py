@@ -42,7 +42,7 @@ class BaseTFIdentityPipeline(ABC):
         chipseq_file: str = None,
         known_identity_tfs: List[str] = None,
         verbose: bool = True,
-        jsd_method: Literal['jsd', 'bhattacharyya', 'geometric_jsd', 'mmd'] = 'jsd',
+        jsd_method: Literal['jsd', 'bhattacharyya', 'geometric_jsd', 'gaussian_gjsd', 'extended_gjsd', 'mmd'] = 'jsd',
         expr_method: Literal['scgx', 'expr_density', 'iqr_threshold', 'wilcoxon'] = 'wilcoxon',
         main_filter: Literal['high_only', 'unique_only', 'high_and_unique'] = 'high_and_unique',
         n_processes: int = None,
@@ -136,11 +136,19 @@ class BaseTFIdentityPipeline(ABC):
         self.X_target = self.X_dense[self.target_indices, :]
         self.X_other = self.X_dense[self.other_indices, :] if self.n_other > 0 else None
         
-        # Pre-compute mean expression in other cells for all genes
+        # Pre-compute mean and variance expression in other cells for all genes
         if self.X_other is not None:
             self.mu_other_all = np.mean(self.X_other, axis=0)
+            
+            # Pre-compute variance for Gaussian G-JSD methods (ddof=1 for sample variance)
+            if self.n_other > 1:
+                self.var_other_all = np.var(self.X_other, axis=0, ddof=1)
+            else:
+                # Single cell: use mean as variance estimate (Poisson-like assumption)
+                self.var_other_all = np.maximum(self.mu_other_all, 1e-12)
         else:
             self.mu_other_all = np.zeros(self.X_dense.shape[1])
+            self.var_other_all = np.ones(self.X_dense.shape[1]) * 1e-12
 
 # ========================================================================
 # METHODS FOR SPECIFICITY CALCULATION
@@ -148,6 +156,187 @@ class BaseTFIdentityPipeline(ABC):
     # ========================================================================
     # STATIC METHOD FOR PARALLEL PROCESSING
     # ========================================================================
+    # @staticmethod
+    # def _compute_jsd_single_gene_parallel(gene_data: Tuple, method: str = 'jsd') -> Tuple[str, float]:
+    #     """
+    #     Compute per-gene specificity score across target cells.
+
+    #     Parameters
+    #     ----------
+    #     gene_data : Tuple
+    #         Expected formats:
+    #           - (gene_name, target_expr, n_target, mu_other)
+    #             backwards-compatible: mu_other is mean expression in the 'other' population.
+    #           - (gene_name, target_expr, n_target, mu_other, n_other, total_cells)
+    #             extended: includes the number of 'other' cells and total cell count (used by PMI).
+    #     method : str
+    #         One of: 'jsd' (arithmetic JSD), 'geometric_jsd', 'alpha_jsd', 'bhattacharyya',
+    #                 'hellinger', 'pmi'
+    #     alpha : float
+    #         For 'alpha_jsd' or 'geometric_jsd' (geometric_jsd uses alpha=0.5).
+    #     Returns
+    #     -------
+    #     (gene_name, score_sum)
+    #       score_sum is the sum of per-target-cell scores (matching your original API).
+    #       Note: for methods like PMI you may prefer a single summary score (we compute a per-cell
+    #       contribution and sum for API compatibility).
+    #     """
+
+    #     # Unpack gene_data supporting both 4- and 6-tuple formats
+    #     if len(gene_data) == 4:
+    #         gene_name, target_expr, n_target, mu_other = gene_data
+    #         n_other = None
+    #         total_cells = None
+    #     elif len(gene_data) == 6:
+    #         gene_name, target_expr, n_target, mu_other, n_other, total_cells = gene_data
+    #     else:
+    #         raise ValueError("gene_data must be a 4-tuple or 6-tuple. Received length: {}".format(len(gene_data)))
+
+    #     # Ensure target_expr is an array
+    #     target_expr = np.asarray(target_expr, dtype=float)
+    #     if len(target_expr) != n_target:
+    #         # warning: lengths mismatch - prefer to trust provided n_target but we'll use len()
+    #         n_target = len(target_expr)
+
+    #     eps = 1e-12  # small stabilizer for logs / denominators
+    #     score_sum = 0.0
+
+    #     # Precompute some sums if needed (PMI)
+    #     sum_target_expr = float(np.sum(target_expr))
+    #     if n_other is not None:
+    #         sum_other_expr_est = float(mu_other) * float(n_other)
+    #         total_expr_est = sum_target_expr + sum_other_expr_est
+    #     else:
+    #         total_expr_est = None
+
+    #     # iterate per target cell (keeps original behaviour)
+    #     for i in range(n_target):
+    #         x_cell = float(target_expr[i])
+
+    #         denom = x_cell + mu_other
+
+    #         # If both are zero -> identical distributions => divergence 0.
+    #         if denom == 0.0:
+    #             score = 0.0
+    #             score_sum += score
+    #             continue
+
+    #         # two-bin pmf for this cell
+    #         p0 = x_cell / denom
+    #         p1 = mu_other / denom
+
+    #         # reference q: point mass on first bin
+    #         q0 = 1.0
+    #         q1 = 0.0
+
+    #         # Numerical safety
+    #         p0_safe = max(p0, eps)
+    #         p1_safe = max(p1, eps)
+    #         q0_safe = max(q0, eps)
+    #         q1_safe = max(q1, eps)
+
+    #         if method == 'jsd':
+    #             # arithmetic-mean JSD
+    #             m0 = 0.5 * (p0 + q0)
+    #             m1 = 0.5 * (p1 + q1)
+    #             m0 = max(m0, eps)
+    #             m1 = max(m1, eps)
+
+    #             kl_pm = 0.0
+    #             if p0 > 0.0:
+    #                 kl_pm += p0 * np.log2(p0_safe / m0)
+    #             if p1 > 0.0:
+    #                 kl_pm += p1 * np.log2(p1_safe / m1)
+
+    #             kl_qm = 0.0
+    #             # q0 = 1
+    #             kl_qm += q0 * np.log2(q0_safe / m0)
+
+    #             score = 0.5 * (kl_pm + kl_qm)
+
+    #         elif method in ('geometric_jsd', 'alpha_jsd'):
+    #             # alpha controls the geometric interpolation; alpha=0.5 is geometric JSD
+    #             if method == 'geometric_jsd':
+    #                 alpha_used = 0.5
+    #             else:
+    #                 alpha: float = 0.5
+    #                 alpha_used = float(alpha)
+    #                 if not (0.0 < alpha_used <= 1.0):
+    #                     raise ValueError("alpha must be in (0,1]. Got: {}".format(alpha_used))
+
+    #             # geometric interpolation in log space
+    #             log_m0 = alpha_used * np.log(p0_safe) + (1.0 - alpha_used) * np.log(q0_safe)
+    #             log_m1 = alpha_used * np.log(p1_safe) + (1.0 - alpha_used) * np.log(q1_safe)
+    #             m0 = np.exp(log_m0)
+    #             m1 = np.exp(log_m1)
+    #             m_sum = m0 + m1
+    #             m0 /= m_sum
+    #             m1 /= m_sum
+    #             m0 = max(m0, eps)
+    #             m1 = max(m1, eps)
+
+    #             kl_pm = 0.0
+    #             if p0 > eps:
+    #                 kl_pm += p0 * np.log2(p0_safe / m0)
+    #             if p1 > eps:
+    #                 kl_pm += p1 * np.log2(p1_safe / m1)
+
+    #             kl_qm = 0.0
+    #             if q0 > eps:
+    #                 kl_qm += q0 * np.log2(q0_safe / m0)
+    #             if q1 > eps:
+    #                 kl_qm += q1 * np.log2(q1_safe / m1)
+
+    #             score = 0.5 * (kl_pm + kl_qm)
+
+    #         elif method == 'bhattacharyya':
+    #             # BC = sum(sqrt(p_i * q_i)) = sqrt(p0 * q0) + sqrt(p1 * q1)
+    #             bc = np.sqrt(p0_safe * q0_safe) + np.sqrt(p1_safe * q1_safe)
+    #             # Convert BC to dissimilarity in [0,1]: 1 - BC (note: not a metric but convenient)
+    #             # bc is <= sqrt(1*1)+... but with two bins and proper normalization bc <= 1
+    #             score = max(0.0, 1.0 - bc)
+
+    #         elif method == 'hellinger':
+    #             # Hellinger distance: H = (1/sqrt(2)) * sqrt(sum (sqrt(p)-sqrt(q))^2)
+    #             h = np.sqrt((np.sqrt(p0_safe) - np.sqrt(q0_safe))**2 + (np.sqrt(p1_safe) - np.sqrt(q1_safe))**2)
+    #             score = (1.0 / np.sqrt(2.0)) * h  # in [0,1]
+
+    #         elif method == 'pmi':
+    #             # PMI requires knowledge of n_other and total_cells to compute marginals.
+    #             if (n_other is None) or (total_expr_est is None) or (total_cells is None):
+    #                 raise ValueError("PMI requires gene_data to contain n_other and total_cells "
+    #                                  "(use 6-tuple: gene_name, target_expr, n_target, mu_other, n_other, total_cells).")
+
+    #             # Compute approximate p(tf, c), p(tf), p(c) using expression mass
+    #             # p(tf, c) ≈ sum_target_expr / total_expr_all
+    #             # p(tf) ≈ (sum_target_expr + sum_other_expr_est) / total_expr_all
+    #             # p(c) ≈ n_target / total_cells
+    #             sum_other_expr_est = mu_other * n_other
+    #             total_expr_all = sum_target_expr + sum_other_expr_est + eps
+
+    #             p_tf_c = (sum_target_expr + eps) / total_expr_all
+    #             p_tf = (sum_target_expr + sum_other_expr_est + eps) / total_expr_all
+    #             p_c = (n_target + eps) / (total_cells + eps)
+
+    #             # PMI (can be negative). We'll use Positive PMI (PPMI) or a normalized variant.
+    #             raw_pmi = np.log2((p_tf_c) / (p_tf * p_c + eps) + eps)
+    #             # Convert to a bounded positive score: e.g., positive PMI normalized by a log factor.
+    #             # We map raw_pmi in [-inf, +inf] to [0,1] by sigmoid-like transform (but keep interpretability)
+    #             # Simple scaling: max(0, raw_pmi) / (1 + max(0, raw_pmi))
+    #             pos_pmi = max(0.0, raw_pmi)
+    #             score = pos_pmi / (1.0 + pos_pmi)
+
+    #         else:
+    #             raise ValueError(f"Unknown method: {method}")
+
+    #         # ensure non-negative and finite
+    #         if not np.isfinite(score) or score < 0.0:
+    #             score = max(0.0, float(np.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0)))
+
+    #         score_sum += score
+
+    #     return gene_name, float(score_sum)        
+
     @staticmethod
     def _compute_jsd_single_gene_parallel(gene_data: Tuple, method: str = 'jsd') -> Tuple[str, float]:
         """
@@ -157,21 +346,21 @@ class BaseTFIdentityPipeline(ABC):
         ----------
         gene_data : Tuple
             Expected formats:
-              - (gene_name, target_expr, n_target, mu_other)
+            - (gene_name, target_expr, n_target, mu_other)
                 backwards-compatible: mu_other is mean expression in the 'other' population.
-              - (gene_name, target_expr, n_target, mu_other, n_other, total_cells)
+            - (gene_name, target_expr, n_target, mu_other, n_other, total_cells)
                 extended: includes the number of 'other' cells and total cell count (used by PMI).
+            - (gene_name, target_expr, n_target, mu_other, var_other, ...)
+                For gaussian methods: if var_other is provided, it will be used directly.
         method : str
-            One of: 'jsd' (arithmetic JSD), 'geometric_jsd', 'alpha_jsd', 'bhattacharyya',
-                    'hellinger', 'pmi'
-        alpha : float
-            For 'alpha_jsd' or 'geometric_jsd' (geometric_jsd uses alpha=0.5).
+            One of: 'jsd' (arithmetic JSD), 'geometric_jsd', 'gaussian_gjsd', 
+                    'extended_gjsd', 'alpha_jsd', 'bhattacharyya', 'hellinger', 'pmi'
+        
         Returns
         -------
         (gene_name, score_sum)
-          score_sum is the sum of per-target-cell scores (matching your original API).
-          Note: for methods like PMI you may prefer a single summary score (we compute a per-cell
-          contribution and sum for API compatibility).
+        score_sum is the sum of per-target-cell scores (matching your original API).
+        For Gaussian methods, returns G-JSD scaled by n_target for comparability.
         """
 
         # Unpack gene_data supporting both 4- and 6-tuple formats
@@ -179,20 +368,110 @@ class BaseTFIdentityPipeline(ABC):
             gene_name, target_expr, n_target, mu_other = gene_data
             n_other = None
             total_cells = None
+            var_other_provided = None
+        elif len(gene_data) == 5:
+            # Format for Gaussian methods: includes variance
+            gene_name, target_expr, n_target, mu_other, var_other_provided = gene_data
+            n_other = None
+            total_cells = None
         elif len(gene_data) == 6:
             gene_name, target_expr, n_target, mu_other, n_other, total_cells = gene_data
+            var_other_provided = None
+        elif len(gene_data) == 7:
+            # Extended format with variance: (gene_name, target_expr, n_target, mu_other, var_other, n_other, total_cells)
+            gene_name, target_expr, n_target, mu_other, var_other_provided, n_other, total_cells = gene_data
         else:
-            raise ValueError("gene_data must be a 4-tuple or 6-tuple. Received length: {}".format(len(gene_data)))
+            raise ValueError("gene_data must be a 4-, 6-, or 7-tuple. Received length: {}".format(len(gene_data)))
 
         # Ensure target_expr is an array
         target_expr = np.asarray(target_expr, dtype=float)
         if len(target_expr) != n_target:
-            # warning: lengths mismatch - prefer to trust provided n_target but we'll use len()
             n_target = len(target_expr)
 
         eps = 1e-12  # small stabilizer for logs / denominators
         score_sum = 0.0
 
+        # =========================================================================
+        # GAUSSIAN CLOSED-FORM METHODS (from Nielsen 2025 paper)
+        # "Two Types of Geometric Jensen-Shannon Divergences"
+
+        # CONVENTION: HIGH score = HIGH specificity (divergence measure)
+        # =========================================================================
+        if method in ('gaussian_gjsd', 'extended_gjsd'):
+            
+            # --- Compute statistics for TARGET population ---
+            mu_target = float(np.mean(target_expr))
+            
+            if n_target >= 2:
+                var_target = float(np.var(target_expr, ddof=1))
+            else:
+                var_target = max(mu_target, eps)
+            
+            var_target = max(var_target, eps)
+            
+            # --- Use variance for OTHER population ---
+            mu_other_val = float(mu_other)
+            
+            if var_other_provided is not None:
+                var_other = max(float(var_other_provided), eps)
+            else:
+                if mu_target > eps:
+                    cv_target = np.sqrt(var_target) / mu_target
+                    var_other = (cv_target * max(mu_other_val, eps)) ** 2
+                    var_other = max(var_other, eps)
+                else:
+                    var_other = var_target
+
+            v1, v2 = var_target, var_other
+            mu1, mu2 = mu_target, mu_other_val
+            
+            # Handle edge case: both means near zero (gene not expressed)
+            # Return 0 divergence (not specific - neither population expresses it)
+            if abs(mu1) < eps and abs(mu2) < eps:
+                return gene_name, 0.0
+            
+            # =====================================================================
+            # CLOSED-FORM G-JSD FOR UNIVARIATE GAUSSIANS (Proposition 3)
+            # G-JSD = (1/2) * Jeffreys - Bhattacharyya
+            # =====================================================================
+            
+            # --- Jeffreys Divergence ---
+            # J(P,Q) = (1/2)(σ₁²/σ₂² + σ₂²/σ₁² - 2) + (1/2)(μ₁-μ₂)²(1/σ₁² + 1/σ₂²)
+            variance_ratio_term = 0.5 * (v1/v2 + v2/v1 - 2.0)
+            mean_diff_term = 0.5 * (mu1 - mu2)**2 * (1.0/v1 + 1.0/v2)
+            jeffreys = variance_ratio_term + mean_diff_term
+            
+            # --- Bhattacharyya Distance ---
+            # B(P,Q) = (μ₁-μ₂)²/(4(σ₁²+σ₂²)) + (1/2)log((σ₁²+σ₂²)/(2√(σ₁²σ₂²)))
+            var_sum = v1 + v2
+            bhattacharyya = (
+                (mu1 - mu2)**2 / (4.0 * var_sum) +
+                0.5 * np.log(var_sum / (2.0 * np.sqrt(v1 * v2)))
+            )
+            
+            # --- G-JSD (Proposition 3) ---
+            if method == 'gaussian_gjsd':
+                gjsd = 0.5 * jeffreys - bhattacharyya
+            else:  # 'extended_gjsd'
+                # Extended G-JSD (Proposition 4) - same formula for probability densities
+                gjsd = 0.5 * jeffreys - bhattacharyya
+            
+            # Ensure non-negative
+            gjsd = max(0.0, gjsd)
+            
+            if not np.isfinite(gjsd):
+                gjsd = 0.0
+            
+            # Scale by n_target for API compatibility
+            # HIGH gjsd = HIGH specificity
+            score_sum = (1/gjsd) * n_target
+            
+            return gene_name, float(score_sum)
+
+        # =========================================================================
+        # ORIGINAL PER-CELL DISCRETE METHODS (preserved for backward compatibility)
+        # =========================================================================
+        
         # Precompute some sums if needed (PMI)
         sum_target_expr = float(np.sum(target_expr))
         if n_other is not None:
@@ -204,7 +483,6 @@ class BaseTFIdentityPipeline(ABC):
         # iterate per target cell (keeps original behaviour)
         for i in range(n_target):
             x_cell = float(target_expr[i])
-
             denom = x_cell + mu_other
 
             # If both are zero -> identical distributions => divergence 0.
@@ -241,13 +519,11 @@ class BaseTFIdentityPipeline(ABC):
                     kl_pm += p1 * np.log2(p1_safe / m1)
 
                 kl_qm = 0.0
-                # q0 = 1
                 kl_qm += q0 * np.log2(q0_safe / m0)
 
                 score = 0.5 * (kl_pm + kl_qm)
 
             elif method in ('geometric_jsd', 'alpha_jsd'):
-                # alpha controls the geometric interpolation; alpha=0.5 is geometric JSD
                 if method == 'geometric_jsd':
                     alpha_used = 0.5
                 else:
@@ -282,27 +558,18 @@ class BaseTFIdentityPipeline(ABC):
                 score = 0.5 * (kl_pm + kl_qm)
 
             elif method == 'bhattacharyya':
-                # BC = sum(sqrt(p_i * q_i)) = sqrt(p0 * q0) + sqrt(p1 * q1)
                 bc = np.sqrt(p0_safe * q0_safe) + np.sqrt(p1_safe * q1_safe)
-                # Convert BC to dissimilarity in [0,1]: 1 - BC (note: not a metric but convenient)
-                # bc is <= sqrt(1*1)+... but with two bins and proper normalization bc <= 1
                 score = max(0.0, 1.0 - bc)
 
             elif method == 'hellinger':
-                # Hellinger distance: H = (1/sqrt(2)) * sqrt(sum (sqrt(p)-sqrt(q))^2)
-                h = np.sqrt((np.sqrt(p0_safe) - np.sqrt(q0_safe))**2 + (np.sqrt(p1_safe) - np.sqrt(q1_safe))**2)
-                score = (1.0 / np.sqrt(2.0)) * h  # in [0,1]
+                h = np.sqrt((np.sqrt(p0_safe) - np.sqrt(q0_safe))**2 + 
+                        (np.sqrt(p1_safe) - np.sqrt(q1_safe))**2)
+                score = (1.0 / np.sqrt(2.0)) * h
 
             elif method == 'pmi':
-                # PMI requires knowledge of n_other and total_cells to compute marginals.
                 if (n_other is None) or (total_expr_est is None) or (total_cells is None):
-                    raise ValueError("PMI requires gene_data to contain n_other and total_cells "
-                                     "(use 6-tuple: gene_name, target_expr, n_target, mu_other, n_other, total_cells).")
+                    raise ValueError("PMI requires 6-tuple gene_data.")
 
-                # Compute approximate p(tf, c), p(tf), p(c) using expression mass
-                # p(tf, c) ≈ sum_target_expr / total_expr_all
-                # p(tf) ≈ (sum_target_expr + sum_other_expr_est) / total_expr_all
-                # p(c) ≈ n_target / total_cells
                 sum_other_expr_est = mu_other * n_other
                 total_expr_all = sum_target_expr + sum_other_expr_est + eps
 
@@ -310,25 +577,20 @@ class BaseTFIdentityPipeline(ABC):
                 p_tf = (sum_target_expr + sum_other_expr_est + eps) / total_expr_all
                 p_c = (n_target + eps) / (total_cells + eps)
 
-                # PMI (can be negative). We'll use Positive PMI (PPMI) or a normalized variant.
                 raw_pmi = np.log2((p_tf_c) / (p_tf * p_c + eps) + eps)
-                # Convert to a bounded positive score: e.g., positive PMI normalized by a log factor.
-                # We map raw_pmi in [-inf, +inf] to [0,1] by sigmoid-like transform (but keep interpretability)
-                # Simple scaling: max(0, raw_pmi) / (1 + max(0, raw_pmi))
                 pos_pmi = max(0.0, raw_pmi)
                 score = pos_pmi / (1.0 + pos_pmi)
 
             else:
                 raise ValueError(f"Unknown method: {method}")
 
-            # ensure non-negative and finite
             if not np.isfinite(score) or score < 0.0:
                 score = max(0.0, float(np.nan_to_num(score, nan=0.0, posinf=0.0, neginf=0.0)))
 
             score_sum += score
 
-        return gene_name, float(score_sum)        
-
+        return gene_name, float(score_sum)
+    
     def compute_mmd_for_gene(self, gene: str, kernel: str = 'rbf') -> float:
         """
         Compute MMD for a single gene.
@@ -471,6 +733,9 @@ class BaseTFIdentityPipeline(ABC):
         # Prepare data for parallel processing
         gene_data_list = []
         
+        # Check if using Gaussian methods that need variance
+        use_gaussian = method in ('gaussian_gjsd', 'extended_gjsd')
+        
         for gene in genes:
             if gene not in self.adata.var_names:
                 continue
@@ -481,7 +746,13 @@ class BaseTFIdentityPipeline(ABC):
             target_expr = self.X_target[:, gene_idx]
             mu_other = self.mu_other_all[gene_idx]
             
-            gene_data_list.append((gene, target_expr, self.n_target, mu_other))
+            if use_gaussian:
+                # Include variance for Gaussian closed-form methods
+                var_other = self.var_other_all[gene_idx]
+                gene_data_list.append((gene, target_expr, self.n_target, mu_other, var_other))
+            else:
+                # Original 4-tuple format
+                gene_data_list.append((gene, target_expr, self.n_target, mu_other))
         
         if not gene_data_list:
             return {}
@@ -706,7 +977,8 @@ class BaseTFIdentityPipeline(ABC):
         """
         if self.expr_method == 'scgx':
             tfs_high_df = pd.read_csv(self.scgx_sig_file, sep='\t')
-            iqr_thresh = np.percentile(tfs_high_df['not.0.perc'], 25) + 1.5*(np.percentile(tfs_high_df['not.0.perc'], 75) - np.percentile(tfs_high_df['not.0.perc'], 25)) 
+            iqr_thresh = np.percentile(tfs_high_df['not.0.perc'], 25) + 0.5*(np.percentile(tfs_high_df['not.0.perc'], 75) - np.percentile(tfs_high_df['not.0.perc'], 25)) 
+            # iqr_thresh = 0 
             high_tfs_low = tfs_high_df[(tfs_high_df['not.0.perc'] > iqr_thresh) & (tfs_high_df['expr.level'] == 'low')]['gene'].tolist()
             high_tfs = tfs_high_df[
                 tfs_high_df['expr.level'].isin(['high', 'medium'])
