@@ -826,7 +826,9 @@ class MetadataBuilder:
     """
     def __init__(self, output_dir: str = "./metadata"):
         self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(exist_ok=True)
+
+        # Create directory if it does not exist (including parents)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.census_utils = CellxgenePpUtils(organism='homo_sapiens')
         self.datasets_info = []
     

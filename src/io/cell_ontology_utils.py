@@ -735,10 +735,6 @@ class FAISSIndexBuilder:
 
 # Improved SemanticReferenceRetriever with hybrid search capabilities
 # Replace the existing class in cell_ontology_utils.py
-
-
-
-
 class SemanticReferenceRetriever:
     """
     Semantic search for reference cell types
@@ -749,7 +745,7 @@ class SemanticReferenceRetriever:
     - Negative keyword filtering
     - Better query handling
     """
-    def __init__(self, base_dir: str, use_sapbert: bool = True):
+    def __init__(self, base_dir: str, use_sapbert: bool = True, cl_obo_path: str = None):
         self.base_dir = Path(base_dir)
         
         print("Loading semantic search system...")
@@ -763,10 +759,19 @@ class SemanticReferenceRetriever:
             model_name = 'pritamdeka/S-PubMedBert-MS-MARCO'
             embeddings_file = 'embeddings.npy'
             print(f"  Using: PubMedBERT")
-        
+
+        # NEW: Load ontology for background selection
+        if cl_obo_path:
+            print("  Loading Cell Ontology for background selection...")
+            self.ontology = OntologyBackgroundSelector(cl_obo_path)
+            print(f" Ontology loaded ({len(self.ontology.terms)} terms)")
+        else:
+            print("  No CL ontology path provided - ontology features disabled")
+            self.ontology = None
+
         # Load model
         self.model = SentenceTransformer(model_name)
-        print("  ✓ Model loaded")
+        print("  Model loaded")
         
         # Load embeddings
         embeddings_path = self.base_dir / 'embeddings' / embeddings_file
@@ -784,17 +789,17 @@ class SemanticReferenceRetriever:
         if not np.allclose(norms, 1.0, atol=1e-5):
             self.embeddings = self.embeddings / norms
         
-        print(f"  ✓ Embeddings loaded ({self.embeddings.shape})")
+        print(f"  Embeddings loaded ({self.embeddings.shape})")
         
         # Load metadata
         metadata_path = self.base_dir / 'embeddings' / 'cell_type_metadata.csv'
         self.metadata_df = pd.read_csv(metadata_path)
-        print(f"  ✓ Metadata loaded ({len(self.metadata_df)} cell types)")
+        print(f"  Metadata loaded ({len(self.metadata_df)} cell types)")
         
         # Build keyword index for fast lookup
         self._build_keyword_index()
         
-        print("\n✓ Ready for semantic search!")
+        print("\nReady for semantic search!")
     
     def _build_keyword_index(self):
         """Build inverted index for keyword search"""
@@ -815,7 +820,7 @@ class SemanticReferenceRetriever:
                     self.keyword_index[token] = set()
                 self.keyword_index[token].add(idx)
         
-        print(f"  ✓ Keyword index built ({len(self.keyword_index)} unique terms)")
+        print(f"  Keyword index built ({len(self.keyword_index)} unique terms)")
     
     def _get_keyword_matches(self, keywords: List[str]) -> Set[int]:
         """Get indices that match any of the keywords"""
@@ -943,7 +948,7 @@ class SemanticReferenceRetriever:
         results_df = pd.DataFrame(results)
         
         if len(results_df) == 0:
-            print("⚠ No results found. Try relaxing filters.")
+            print("No results found. Try relaxing filters.")
             return results_df
         
         # Add ontology depth
@@ -1253,6 +1258,345 @@ class SemanticReferenceRetriever:
             print(f"\n... and {len(df) - 20} more")
         
         return df
+    def select_background_for_query(self, 
+                                     query: str,
+                                     organ_filter: str = None,
+                                     min_cells: int = 100,
+                                     max_results_per_type: int = 5) -> dict:
+        """
+        Automatically select background cell types based on ontology
+        
+        Parameters:
+        -----------
+        query : str
+            Cell type name or CL ID (e.g., "GABAergic neuron" or "CL:0000617")
+        organ_filter : str, optional
+            Restrict to specific organ (e.g., 'brain')
+        min_cells : int
+            Minimum cells per cell type entry
+        max_results_per_type : int
+            Max entries to return per cell type
+        
+        Returns:
+        --------
+        dict with:
+            - query_info: dict (query name, CL ID, etc.)
+            - background_cell_types: list of dict (CL ID, name, n_datasets, n_cells)
+            - available_entries: pd.DataFrame (actual metadata entries)
+            - summary: dict (totals)
+        
+        Example:
+        --------
+        >>> result = retriever.select_background_for_query("GABAergic neuron", organ_filter="brain")
+        >>> print(f"Found {len(result['background_cell_types'])} cell types")
+        >>> print(f"Total cells: {result['summary']['total_cells']:,}")
+        """
+        if not self.ontology:
+            raise ValueError("Ontology not loaded. Initialize with cl_obo_path parameter.")
+        
+        print(f"\n{'='*100}")
+        print(f"SELECTING BACKGROUND FOR: {query}")
+        print(f"{'='*100}\n")
+        
+        # Step 1: Try ontology-based selection
+        ontology_spec = self.ontology.get_background_spec(query)
+        
+        if ontology_spec['strategy'] == 'semantic_needed':
+            # Ontology failed - use semantic search
+            print(f"⚠ {ontology_spec['reasoning']}")
+            print(f"  → Using semantic search to find closest match...\n")
+            
+            semantic_results = self.search_semantic(
+                query_text=query,
+                k=5,
+                organ_filter=organ_filter,
+                min_cells=min_cells,
+                exclude_broad_terms=True
+            )
+            
+            if len(semantic_results) == 0:
+                raise ValueError(f"No matches found for query '{query}'")
+            
+            # Use top match
+            best_match = semantic_results.iloc[0]
+            matched_cl_id = best_match['ontology_id']
+            
+            print(f"✓ Best match: {best_match['cell_type_name']} ({matched_cl_id})")
+            print(f"  Similarity: {best_match['similarity']:.3f}\n")
+            
+            # Now get siblings for the matched term
+            ontology_spec = self.ontology.get_background_spec(matched_cl_id)
+        
+        # Step 2: Get siblings from ontology
+        print(f"📊 Ontology Analysis:")
+        print(f"  Query: {ontology_spec['query_name']} ({ontology_spec['query_cl_id']})")
+        print(f"  Parent: {ontology_spec.get('biological_parent_name', 'unknown')}")
+        print(f"  Siblings: {ontology_spec['n_siblings']}\n")
+        
+        # Step 3: Find which siblings are available in metadata
+        background_cl_ids = ontology_spec['background_cl_ids']
+        
+        # Filter metadata for these CL IDs
+        available_df = self.metadata_df[
+            self.metadata_df['ontology_id'].isin(background_cl_ids)
+        ].copy()
+        
+        # Apply filters
+        if organ_filter:
+            available_df = available_df[available_df['organ'] == organ_filter]
+        
+        if min_cells:
+            available_df = available_df[available_df['n_cells'] >= min_cells]
+        
+        # Limit results per cell type
+        if max_results_per_type:
+            available_df = available_df.groupby('ontology_id').head(max_results_per_type)
+        
+        # Sort by cell count
+        available_df = available_df.sort_values('n_cells', ascending=False)
+        
+        # Step 4: Summarize by cell type
+        cell_type_summary = []
+        for cl_id in background_cl_ids:
+            entries = available_df[available_df['ontology_id'] == cl_id]
+            if len(entries) > 0:
+                cell_type_summary.append({
+                    'ontology_id': cl_id,
+                    'cell_type_name': entries.iloc[0]['cell_type_name'],
+                    'n_datasets': len(entries['dataset_id'].unique()),
+                    'n_entries': len(entries),
+                    'total_cells': entries['n_cells'].sum()
+                })
+        
+        print(f"🔍 Available in Metadata:")
+        print(f"  Found {len(cell_type_summary)}/{len(background_cl_ids)} sibling types")
+        print(f"  Total entries: {len(available_df)}")
+        print(f"  Total cells: {available_df['n_cells'].sum():,}\n")
+        
+        # Display top cell types
+        if cell_type_summary:
+            print(f"Top Background Cell Types:")
+            print(f"{'Cell Type':<50s} {'Entries':<10s} {'Cells':<15s}")
+            print("-"*80)
+            for ct in sorted(cell_type_summary, key=lambda x: x['total_cells'], reverse=True)[:10]:
+                print(f"{ct['cell_type_name']:<50s} {ct['n_entries']:<10d} {ct['total_cells']:>12,}")
+            if len(cell_type_summary) > 10:
+                print(f"... and {len(cell_type_summary)-10} more")
+        
+        return {
+            'query_info': {
+                'original_query': query,
+                'resolved_cl_id': ontology_spec['query_cl_id'],
+                'resolved_name': ontology_spec['query_name'],
+                'strategy': ontology_spec['strategy']
+            },
+            'background_cell_types': cell_type_summary,
+            'available_entries': available_df,
+            'summary': {
+                'n_sibling_types_ontology': len(background_cl_ids),
+                'n_sibling_types_available': len(cell_type_summary),
+                'n_entries': len(available_df),
+                'total_cells': int(available_df['n_cells'].sum()),
+                'datasets': available_df['dataset_id'].unique().tolist()
+            }
+        }
+    
+    def get_dataset_ids_for_background(self, background_result: dict) -> list:
+        """
+        Extract dataset IDs from background selection result
+        
+        Parameters:
+        -----------
+        background_result : dict
+            Output from select_background_for_query()
+        
+        Returns:
+        --------
+        list of str: Dataset IDs to download
+        """
+        df = background_result['available_entries']
+        return df['dataset_id'].unique().tolist()
 
 
-
+class OntologyBackgroundSelector:
+    """
+    Selects background cell types based on Cell Ontology hierarchy
+    """
+    def __init__(self, obo_path: str):
+        """
+        Parameters:
+        -----------
+        obo_path : str
+            Path to cl.obo file
+        """
+        self.terms = {}
+        self.functional_keywords = ['secretory', 'signaling', 'responsive', 'active', 'capable']
+        self._parse_obo(obo_path)
+    
+    def _parse_obo(self, obo_path: str):
+        """Parse OBO file (simple parser, no pronto dependency)"""
+        import re
+        
+        current_term = None
+        
+        with open(obo_path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                
+                if line.startswith('[Term]'):
+                    if current_term and 'id' in current_term:
+                        self.terms[current_term['id']] = current_term
+                    current_term = {}
+                    
+                elif current_term is not None:
+                    if line.startswith('id: '):
+                        current_term['id'] = line[4:].strip()
+                    elif line.startswith('name: '):
+                        current_term['name'] = line[6:].strip()
+                    elif line.startswith('def: '):
+                        current_term['definition'] = line[5:].strip()
+                    elif line.startswith('is_a: '):
+                        parent_match = re.match(r'is_a: (CL:\d+)', line)
+                        if parent_match:
+                            if 'parents' not in current_term:
+                                current_term['parents'] = []
+                            current_term['parents'].append(parent_match.group(1))
+            
+            # Add last term
+            if current_term and 'id' in current_term:
+                self.terms[current_term['id']] = current_term
+    
+    def _is_functional_parent(self, parent_id: str) -> bool:
+        """Check if parent is functional classification"""
+        if parent_id not in self.terms:
+            return False
+        parent_name = self.terms[parent_id]['name'].lower()
+        return any(kw in parent_name for kw in self.functional_keywords)
+    
+    def get_biological_parents(self, cl_id: str) -> list:
+        """Get biological parents (exclude functional)"""
+        if cl_id not in self.terms:
+            return []
+        
+        term = self.terms[cl_id]
+        if 'parents' not in term:
+            return []
+        
+        bio_parents = [p for p in term['parents'] if not self._is_functional_parent(p)]
+        
+        # Fallback: if no biological parents, return all
+        if not bio_parents:
+            bio_parents = term['parents']
+        
+        return bio_parents
+    
+    def get_children(self, cl_id: str) -> list:
+        """Get direct children of a term"""
+        children = []
+        for tid, term in self.terms.items():
+            if 'parents' in term and cl_id in term['parents']:
+                children.append(tid)
+        return children
+    
+    def get_siblings(self, cl_id: str, include_self: bool = False) -> list:
+        """
+        Get all siblings through biological parents
+        
+        Returns:
+        --------
+        list of str: Sibling CL IDs
+        """
+        bio_parents = self.get_biological_parents(cl_id)
+        
+        all_siblings = set()
+        for parent_id in bio_parents:
+            children = self.get_children(parent_id)
+            all_siblings.update(children)
+        
+        if not include_self:
+            all_siblings.discard(cl_id)
+        
+        return list(all_siblings)
+    
+    def find_term_by_name(self, query: str) -> str:
+        """
+        Find CL ID by cell type name (case-insensitive)
+        
+        Returns:
+        --------
+        str: CL ID or None
+        """
+        query_lower = query.lower()
+        
+        # Exact match first
+        for tid, term in self.terms.items():
+            if term.get('name', '').lower() == query_lower:
+                return tid
+        
+        # Partial match
+        for tid, term in self.terms.items():
+            if query_lower in term.get('name', '').lower():
+                return tid
+        
+        return None
+    
+    def get_background_spec(self, query: str) -> dict:
+        """
+        Get background specification for a query
+        
+        Parameters:
+        -----------
+        query : str
+            Cell type name or CL ID
+        
+        Returns:
+        --------
+        dict with keys:
+            - query_cl_id: str
+            - query_name: str
+            - strategy: 'ontology' or 'semantic_needed'
+            - background_cl_ids: list of str
+            - biological_parent: str
+            - reasoning: str
+        """
+        # Check if it's already a CL ID
+        if query.startswith('CL:'):
+            cl_id = query
+            if cl_id not in self.terms:
+                return {
+                    'query_cl_id': query,
+                    'query_name': None,
+                    'strategy': 'semantic_needed',
+                    'background_cl_ids': [],
+                    'reasoning': f'CL ID {query} not found in ontology'
+                }
+            query_name = self.terms[cl_id].get('name', query)
+        else:
+            # Try to find by name
+            cl_id = self.find_term_by_name(query)
+            if not cl_id:
+                return {
+                    'query_cl_id': None,
+                    'query_name': query,
+                    'strategy': 'semantic_needed',
+                    'background_cl_ids': [],
+                    'reasoning': f'No exact match for "{query}" - semantic search needed'
+                }
+            query_name = query
+        
+        # Get siblings
+        siblings = self.get_siblings(cl_id, include_self=False)
+        bio_parents = self.get_biological_parents(cl_id)
+        
+        parent_name = self.terms[bio_parents[0]].get('name', 'unknown') if bio_parents else 'unknown'
+        
+        return {
+            'query_cl_id': cl_id,
+            'query_name': query_name,
+            'strategy': 'ontology',
+            'background_cl_ids': siblings,
+            'biological_parent': bio_parents[0] if bio_parents else None,
+            'biological_parent_name': parent_name,
+            'n_siblings': len(siblings),
+            'reasoning': f'Found {len(siblings)} siblings through parent "{parent_name}"'
+        }
