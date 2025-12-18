@@ -46,6 +46,10 @@ from pathlib import Path
 import json
 
 
+from typing import Dict, List, Tuple, Optional, Set
+from collections import defaultdict
+import re
+
 class SapBERTOptimizedDescriptionGenerator:
     """
     Generate cell type descriptions optimized for SapBERT
@@ -1600,3 +1604,709 @@ class OntologyBackgroundSelector:
             'n_siblings': len(siblings),
             'reasoning': f'Found {len(siblings)} siblings through parent "{parent_name}"'
         }
+"""
+ADD TO END OF cell_ontology_utils.py
+
+This adds:
+1. CellTypeDendrogramClassifier (for harmonization)
+2. OntologyEngine (unified interface)
+"""
+
+
+
+# ============================================================================
+# CELL TYPE DENDROGRAM CLASSIFIER (CORRECTED)
+# ============================================================================
+
+class CellTypeDendrogramClassifier:
+    """
+    Use Cell Ontology tree structure for hierarchical operations.
+    
+    KEY FIX: Filters functional parents (e.g., "electrically responsive cell")
+    to follow biological lineage only.
+    
+    Functional keywords: secretory, signaling, responsive, active, capable
+    """
+    
+    def __init__(self, obo_path: str = None, selector: 'OntologyBackgroundSelector' = None):
+        """
+        Initialize from OBO file or reuse existing selector's data
+        
+        Parameters:
+        -----------
+        obo_path : str, optional
+            Path to cl.obo file
+        selector : OntologyBackgroundSelector, optional
+            Reuse existing parsed ontology
+        """
+        if selector:
+            self.terms = selector.terms
+            self._shared_selector = selector
+        elif obo_path:
+            self.terms = {}
+            self._parse_obo(obo_path)
+            self._shared_selector = None
+        else:
+            raise ValueError("Must provide either obo_path or selector")
+        
+        # Functional parent keywords
+        self.functional_keywords = ['secretory', 'signaling', 'responsive', 'active', 'capable']
+        
+        self.parents_map = {}
+        self.children_map = {}
+        self.depth_cache = {}
+        self.lca_cache = {}
+        self.distance_cache = {}
+        self.path_cache = {}
+        
+        self._build_hierarchy_maps()
+        self._compute_depths()
+    
+    def _parse_obo(self, obo_path: str):
+        """Parse OBO file"""
+        current_term = None
+        
+        with open(obo_path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                line = line.strip()
+                
+                if line.startswith('[Term]'):
+                    if current_term and 'id' in current_term:
+                        self.terms[current_term['id']] = current_term
+                    current_term = {}
+                    
+                elif current_term is not None:
+                    if line.startswith('id: '):
+                        current_term['id'] = line[4:].strip()
+                    elif line.startswith('name: '):
+                        current_term['name'] = line[6:].strip()
+                    elif line.startswith('is_a: '):
+                        parent_match = re.match(r'is_a: (CL:\d+)', line)
+                        if parent_match:
+                            if 'parents' not in current_term:
+                                current_term['parents'] = []
+                            current_term['parents'].append(parent_match.group(1))
+            
+            if current_term and 'id' in current_term:
+                self.terms[current_term['id']] = current_term
+    
+    def _build_hierarchy_maps(self):
+        """Build parent-child maps"""
+        for term_id, term in self.terms.items():
+            parents = term.get('parents', [])
+            self.parents_map[term_id] = parents
+            
+            for parent_id in parents:
+                if parent_id not in self.children_map:
+                    self.children_map[parent_id] = []
+                self.children_map[parent_id].append(term_id)
+    
+    def _compute_depths(self):
+        """Compute depth from root"""
+        root_candidates = ['CL:0000003', 'CL:0000000']
+        
+        for root in root_candidates:
+            if root in self.terms:
+                self.depth_cache[root] = 0
+                break
+        
+        visited = set()
+        queue = [root for root in root_candidates if root in self.terms]
+        
+        while queue:
+            current = queue.pop(0)
+            if current in visited:
+                continue
+            visited.add(current)
+            
+            current_depth = self.depth_cache.get(current, 0)
+            
+            for child in self.children_map.get(current, []):
+                if child not in self.depth_cache:
+                    self.depth_cache[child] = current_depth + 1
+                queue.append(child)
+    
+    def _is_functional_parent(self, parent_id: str) -> bool:
+        """
+        Check if parent is functional classification
+        
+        Functional parents (to skip):
+        - electrically responsive cell
+        - secretory cell
+        - signaling cell
+        - etc.
+        """
+        if parent_id not in self.terms:
+            return False
+        
+        parent_name = self.terms[parent_id].get('name', '').lower()
+        return any(kw in parent_name for kw in self.functional_keywords)
+    
+    def _get_biological_parents(self, cl_id: str) -> List[str]:
+        """
+        Get biological parents (exclude functional)
+        
+        Returns:
+        --------
+        list of str: Biological parent CL IDs
+        """
+        if cl_id not in self.parents_map:
+            return []
+        
+        all_parents = self.parents_map[cl_id]
+        
+        # Filter functional parents
+        biological_parents = [p for p in all_parents if not self._is_functional_parent(p)]
+        
+        # Fallback: if all parents are functional, keep them
+        if not biological_parents:
+            biological_parents = all_parents
+        
+        return biological_parents
+    
+    def get_path_to_root(self, cl_id: str) -> List[str]:
+        """
+        Get path from term to root, following BIOLOGICAL lineage only
+        
+        This is the KEY FIX - skips functional parents like "electrically responsive cell"
+        
+        Returns:
+        --------
+        list of str: [cl_id, parent, grandparent, ..., root]
+        """
+        if cl_id in self.path_cache:
+            return self.path_cache[cl_id]
+        
+        path = [cl_id]
+        current = cl_id
+        visited = set()
+        
+        while True:
+            # Get biological parents only
+            biological_parents = self._get_biological_parents(current)
+            
+            if not biological_parents:
+                break
+            
+            # Choose deepest biological parent
+            parent = max(biological_parents, key=lambda p: self.depth_cache.get(p, -1))
+            
+            if parent in visited:
+                break
+            
+            path.append(parent)
+            visited.add(parent)
+            current = parent
+        
+        self.path_cache[cl_id] = path
+        return path
+    
+    def lowest_common_ancestor(self, cl_ids: List[str]) -> Optional[str]:
+        """Find lowest common ancestor"""
+        if not cl_ids:
+            return None
+        if len(cl_ids) == 1:
+            return cl_ids[0]
+        
+        cache_key = tuple(sorted(cl_ids))
+        if cache_key in self.lca_cache:
+            return self.lca_cache[cache_key]
+        
+        paths = [set(self.get_path_to_root(cl_id)) for cl_id in cl_ids]
+        common = paths[0]
+        for path in paths[1:]:
+            common = common.intersection(path)
+        
+        if not common:
+            return None
+        
+        lca = max(common, key=lambda x: self.depth_cache.get(x, -1))
+        self.lca_cache[cache_key] = lca
+        return lca
+    
+    def distance(self, cl_id1: str, cl_id2: str) -> int:
+        """Compute tree distance between two cell types"""
+        cache_key = tuple(sorted([cl_id1, cl_id2]))
+        if cache_key in self.distance_cache:
+            return self.distance_cache[cache_key]
+        
+        if cl_id1 == cl_id2:
+            return 0
+        
+        path1 = self.get_path_to_root(cl_id1)
+        path2 = self.get_path_to_root(cl_id2)
+        
+        lca = self.lowest_common_ancestor([cl_id1, cl_id2])
+        if not lca:
+            return float('inf')
+        
+        dist1 = path1.index(lca) if lca in path1 else float('inf')
+        dist2 = path2.index(lca) if lca in path2 else float('inf')
+        
+        distance = dist1 + dist2
+        self.distance_cache[cache_key] = distance
+        return distance
+    
+    def harmonize_relative(
+        self,
+        cell_types: List[str],
+        levels_up: int = 2,
+        verbose: bool = False
+    ) -> Dict[str, str]:
+        """
+        Harmonize by going N levels up the BIOLOGICAL tree
+        
+        Parameters:
+        -----------
+        cell_types : list of str
+            Cell type names or CL IDs
+        levels_up : int
+            How many levels to go up (1=parent, 2=grandparent, etc.)
+            Recommended: 2-3 for good harmonization
+        verbose : bool
+            Print warnings
+        
+        Returns:
+        --------
+        dict: {original: harmonized}
+        
+        Example:
+        --------
+        >>> harmonized = classifier.harmonize_relative(
+        ...     ["sst GABAergic cortical interneuron", "basket cell"],
+        ...     levels_up=2
+        ... )
+        >>> # Both → "GABAergic neuron" or "interneuron"
+        """
+        mapping = {}
+        unmapped = []
+        
+        for ct in cell_types:
+            # Find CL ID
+            if ct.startswith('CL:'):
+                cl_id = ct
+            else:
+                cl_id = self._find_term_by_name(ct)
+            
+            if not cl_id:
+                mapping[ct] = "Unknown"
+                unmapped.append(ct)
+                continue
+            
+            # Get biological path (skips functional parents!)
+            path = self.get_path_to_root(cl_id)
+            
+            # Go up N levels
+            target_index = min(levels_up, len(path) - 1)
+            broad_id = path[target_index]
+            
+            if broad_id in self.terms:
+                mapping[ct] = self.terms[broad_id]['name']
+            else:
+                mapping[ct] = self.terms[cl_id]['name']
+        
+        if verbose and unmapped:
+            print(f"⚠ {len(unmapped)} types unmapped: {unmapped[:3]}")
+        
+        return mapping
+    
+    def get_harmonization_preview(
+        self,
+        cell_types: List[str],
+        max_levels: int = 5
+    ) -> Dict[int, Dict[str, Set[str]]]:
+        """
+        Preview harmonization at different levels
+        
+        Shows what groups emerge at levels 1, 2, 3, etc.
+        
+        Returns:
+        --------
+        dict: {level: {broad_category: {original_types}}}
+        """
+        preview = {}
+        
+        for level in range(1, max_levels + 1):
+            harmonized = self.harmonize_relative(cell_types, levels_up=level)
+            
+            # Group by harmonized category
+            groups = defaultdict(set)
+            for orig, broad in harmonized.items():
+                groups[broad].add(orig)
+            
+            preview[level] = dict(groups)
+        
+        return preview
+    
+    def print_harmonization_preview(
+        self,
+        cell_types: List[str],
+        max_levels: int = 4
+    ):
+        """
+        Print harmonization preview at different levels
+        Helps choose optimal levels_up parameter
+        """
+        preview = self.get_harmonization_preview(cell_types, max_levels)
+        
+        print("="*80)
+        print("HARMONIZATION PREVIEW")
+        print("="*80)
+        
+        for level, groups in preview.items():
+            print(f"\n{'─'*80}")
+            print(f"LEVEL {level} (go up {level} step{'s' if level > 1 else ''})")
+            print(f"{'─'*80}")
+            print(f"Results in {len(groups)} categories:\n")
+            
+            for broad, originals in sorted(groups.items(), key=lambda x: len(x[1]), reverse=True):
+                print(f"  {broad} ({len(originals)} types)")
+                for orig in sorted(list(originals))[:3]:
+                    print(f"    - {orig}")
+                if len(originals) > 3:
+                    print(f"    ... and {len(originals)-3} more")
+    
+    def _find_term_by_name(self, name: str) -> Optional[str]:
+        """Find CL ID by name"""
+        name_lower = name.lower()
+        
+        # Exact match
+        for cl_id, term in self.terms.items():
+            if term.get('name', '').lower() == name_lower:
+                return cl_id
+        
+        # Partial match
+        for cl_id, term in self.terms.items():
+            if name_lower in term.get('name', '').lower():
+                return cl_id
+        
+        return None
+    
+    def search_similar_names(self, query: str, max_results: int = 5) -> List[Tuple[str, str, float]]:
+        """Find similar cell type names"""
+        query_lower = query.lower()
+        matches = []
+        
+        for cl_id, term in self.terms.items():
+            name = term.get('name', '').lower()
+            
+            if name == query_lower:
+                matches.append((cl_id, term['name'], 100.0))
+            elif query_lower in name:
+                score = (len(query_lower) / len(name)) * 100
+                matches.append((cl_id, term['name'], score))
+        
+        matches.sort(key=lambda x: x[2], reverse=True)
+        return matches[:max_results]
+
+
+# ============================================================================
+# ONTOLOGY ENGINE - UNIFIED INTERFACE
+# ============================================================================
+
+class OntologyEngine:
+    """
+    Unified interface for all cell type ontology operations:
+    - Background selection (via OntologyBackgroundSelector)
+    - Cell type harmonization (via CellTypeDendrogramClassifier)
+    - Semantic retrieval (via SemanticReferenceRetriever)
+    
+    Usage:
+    ------
+    engine = OntologyEngine(
+        metadata_dir="/path/to/metadata",
+        cl_obo_path="/path/to/cl.obo"
+    )
+    
+    # Background selection
+    background = engine.select_background("GABAergic neuron", organ="brain")
+    
+    # Harmonization (CORRECTED - follows biological lineage)
+    harmonized = engine.harmonize_types(cell_types, levels_up=2)
+    
+    # Semantic search
+    results = engine.search_semantic("interneuron", k=10)
+    """
+    
+    def __init__(
+        self, 
+        metadata_dir: str = None,
+        cl_obo_path: str = None,
+        use_sapbert: bool = True
+    ):
+        """
+        Initialize ontology engine
+        
+        Parameters:
+        -----------
+        metadata_dir : str, optional
+            Path to metadata directory (for semantic search)
+        cl_obo_path : str, optional
+            Path to cl.obo file (for ontology operations)
+        use_sapbert : bool
+            Use SapBERT for semantic search
+        """
+        self.metadata_dir = metadata_dir
+        self.cl_obo_path = cl_obo_path
+        
+        self.selector = None
+        self.classifier = None
+        self.retriever = None
+        
+        # Load ontology components
+        if cl_obo_path:
+            print("Loading Cell Ontology...")
+            self.selector = OntologyBackgroundSelector(cl_obo_path)
+            print(f"  ✓ Loaded {len(self.selector.terms)} terms")
+            
+            print("Initializing harmonization classifier...")
+            self.classifier = CellTypeDendrogramClassifier(selector=self.selector)
+            print("  ✓ Classifier ready (functional parents filtered)")
+        
+        # Load retriever
+        if metadata_dir:
+            print("Loading semantic retriever...")
+            self.retriever = SemanticReferenceRetriever(
+                base_dir=metadata_dir,
+                use_sapbert=use_sapbert
+            )
+            print("  ✓ Retriever ready")
+    
+    # ========================================================================
+    # BACKGROUND SELECTION
+    # ========================================================================
+    
+    def select_background(
+        self,
+        query: str,
+        organ: str = None,
+        min_cells: int = 100,
+        max_results_per_type: int = 5
+    ) -> dict:
+        """Select background cell types using ontology"""
+        if not self.selector or not self.retriever:
+            raise ValueError("Need both cl_obo_path and metadata_dir")
+        
+        ontology_spec = self.selector.get_background_spec(query)
+        
+        if ontology_spec['strategy'] == 'semantic_needed':
+            print(f"⚠ Ontology match not found, using semantic search...")
+            semantic_results = self.retriever.search_semantic(
+                query_text=query,
+                k=5,
+                organ_filter=organ,
+                min_cells=min_cells
+            )
+            
+            if len(semantic_results) == 0:
+                raise ValueError(f"No matches found for '{query}'")
+            
+            best_match = semantic_results.iloc[0]
+            matched_cl_id = best_match['ontology_id']
+            ontology_spec = self.selector.get_background_spec(matched_cl_id)
+        
+        background_cl_ids = ontology_spec['background_cl_ids']
+        
+        available_df = self.retriever.metadata_df[
+            self.retriever.metadata_df['ontology_id'].isin(background_cl_ids)
+        ].copy()
+        
+        if organ:
+            available_df = available_df[available_df['organ'] == organ]
+        if min_cells:
+            available_df = available_df[available_df['n_cells'] >= min_cells]
+        if max_results_per_type:
+            available_df = available_df.groupby('ontology_id').head(max_results_per_type)
+        
+        available_df = available_df.sort_values('n_cells', ascending=False)
+        
+        cell_type_summary = []
+        for cl_id in background_cl_ids:
+            entries = available_df[available_df['ontology_id'] == cl_id]
+            if len(entries) > 0:
+                cell_type_summary.append({
+                    'ontology_id': cl_id,
+                    'cell_type_name': entries.iloc[0]['cell_type_name'],
+                    'n_datasets': len(entries['dataset_id'].unique()),
+                    'n_entries': len(entries),
+                    'total_cells': entries['n_cells'].sum()
+                })
+        
+        return {
+            'query_info': {
+                'original_query': query,
+                'resolved_cl_id': ontology_spec['query_cl_id'],
+                'resolved_name': ontology_spec['query_name'],
+                'strategy': ontology_spec['strategy']
+            },
+            'background_cell_types': cell_type_summary,
+            'available_entries': available_df,
+            'summary': {
+                'n_sibling_types_ontology': len(background_cl_ids),
+                'n_sibling_types_available': len(cell_type_summary),
+                'n_entries': len(available_df),
+                'total_cells': int(available_df['n_cells'].sum()),
+                'datasets': available_df['dataset_id'].unique().tolist()
+            }
+        }
+    
+    # ========================================================================
+    # HARMONIZATION (CORRECTED)
+    # ========================================================================
+    
+    def harmonize_types(
+        self,
+        cell_types: List[str],
+        levels_up: int = 2,
+        verbose: bool = False
+    ) -> Dict[str, str]:
+        """
+        Harmonize cell types to broader categories
+        
+        Uses biological lineage only (skips functional parents)
+        
+        Parameters:
+        -----------
+        cell_types : list of str
+            Cell type names or CL IDs
+        levels_up : int
+            Go N levels up the tree (recommended: 2-3)
+            - 1: direct parent
+            - 2: grandparent (usually best)
+            - 3: great-grandparent (broader)
+        verbose : bool
+            Print warnings
+        
+        Returns:
+        --------
+        dict: {original: harmonized}
+        
+        Example:
+        --------
+        >>> # All interneuron subtypes → "GABAergic neuron"
+        >>> harmonized = engine.harmonize_types(
+        ...     ["sst GABAergic cortical interneuron", "basket cell"],
+        ...     levels_up=2
+        ... )
+        """
+        if not self.classifier:
+            raise ValueError("Classifier not initialized. Provide cl_obo_path.")
+        
+        return self.classifier.harmonize_relative(
+            cell_types,
+            levels_up=levels_up,
+            verbose=verbose
+        )
+    
+    def preview_harmonization(
+        self,
+        cell_types: List[str],
+        max_levels: int = 4
+    ):
+        """
+        Preview harmonization at different levels
+        Helps choose optimal levels_up parameter
+        """
+        if not self.classifier:
+            raise ValueError("Classifier not initialized. Provide cl_obo_path.")
+        
+        self.classifier.print_harmonization_preview(cell_types, max_levels)
+    
+    def validate_background_distances(
+        self,
+        query_cl_id: str,
+        background_cl_ids: List[str]
+    ) -> pd.DataFrame:
+        """Compute distances for background validation"""
+        if not self.classifier:
+            raise ValueError("Classifier not initialized.")
+        
+        results = []
+        for bg_id in background_cl_ids:
+            distance = self.classifier.distance(query_cl_id, bg_id)
+            lca_id = self.classifier.lowest_common_ancestor([query_cl_id, bg_id])
+            
+            if distance == 0:
+                rec = "❌ Same type"
+            elif distance == 1:
+                rec = "❌ Too close (parent/child)"
+            elif 2 <= distance <= 4:
+                rec = "✓ Good"
+            else:
+                rec = "⚠ Far"
+            
+            results.append({
+                'background_id': bg_id,
+                'background_name': self.classifier.terms[bg_id]['name'],
+                'distance': distance,
+                'lca_id': lca_id,
+                'lca_name': self.classifier.terms[lca_id]['name'] if lca_id else None,
+                'recommendation': rec
+            })
+        
+        return pd.DataFrame(results)
+    
+    # ========================================================================
+    # SEMANTIC SEARCH
+    # ========================================================================
+    
+    def search_semantic(
+        self,
+        query_text: str,
+        k: int = 10,
+        organ_filter: str = None,
+        min_cells: int = None
+    ) -> pd.DataFrame:
+        """Semantic search for cell types"""
+        if not self.retriever:
+            raise ValueError("Retriever not initialized. Provide metadata_dir.")
+        
+        return self.retriever.search_semantic(
+            query_text=query_text,
+            k=k,
+            organ_filter=organ_filter,
+            min_cells=min_cells
+        )
+    
+    def search_hybrid(
+        self,
+        query_text: str,
+        positive_keywords: List[str] = None,
+        negative_keywords: List[str] = None,
+        k: int = 10,
+        organ_filter: str = None
+    ) -> pd.DataFrame:
+        """Hybrid semantic + keyword search"""
+        if not self.retriever:
+            raise ValueError("Retriever not initialized. Provide metadata_dir.")
+        
+        return self.retriever.search_hybrid(
+            query_text=query_text,
+            positive_keywords=positive_keywords,
+            negative_keywords=negative_keywords,
+            k=k,
+            organ_filter=organ_filter
+        )
+    
+    # ========================================================================
+    # UTILITY
+    # ========================================================================
+    
+    def get_dataset_ids(self, result: dict) -> List[str]:
+        """Extract dataset IDs from background selection result"""
+        return result['summary']['datasets']
+    
+    def print_summary(self):
+        """Print engine status"""
+        print("="*60)
+        print("ONTOLOGY ENGINE STATUS")
+        print("="*60)
+        print(f"Background Selector: {'✓' if self.selector else '✗'}")
+        print(f"Harmonization:       {'✓' if self.classifier else '✗'}")
+        print(f"Semantic Search:     {'✓' if self.retriever else '✗'}")
+        
+        if self.selector:
+            print(f"\nOntology: {len(self.selector.terms)} terms")
+        if self.retriever:
+            print(f"Metadata: {len(self.retriever.metadata_df)} entries")
+        print("="*60)
