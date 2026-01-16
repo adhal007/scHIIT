@@ -397,21 +397,14 @@ class BaseTFIdentityPipeline(ABC):
 
         # CONVENTION: HIGH score = HIGH specificity (divergence measure)
         # =========================================================================
-        if method in ('gaussian_gjsd', 'extended_gjsd'):
+        if method in ('gaussian_gjsd', 'extended_gjsd', 'asymmetric_gjsd', 'bidirectional_gjsd'):
             
-            # --- Compute statistics for TARGET population ---
+            # --- Compute statistics ---
             mu_target = float(np.mean(target_expr))
-            
-            if n_target >= 2:
-                var_target = float(np.var(target_expr, ddof=1))
-            else:
-                var_target = max(mu_target, eps)
-            
+            var_target = float(np.var(target_expr, ddof=1)) if n_target >= 2 else max(mu_target, eps)
             var_target = max(var_target, eps)
             
-            # --- Use variance for OTHER population ---
             mu_other_val = float(mu_other)
-            
             if var_other_provided is not None:
                 var_other = max(float(var_other_provided), eps)
             else:
@@ -425,48 +418,61 @@ class BaseTFIdentityPipeline(ABC):
             v1, v2 = var_target, var_other
             mu1, mu2 = mu_target, mu_other_val
             
-            # Handle edge case: both means near zero (gene not expressed)
-            # Return 0 divergence (not specific - neither population expresses it)
+            # Edge case: no expression
             if abs(mu1) < eps and abs(mu2) < eps:
-                return gene_name, 0.0
+                if method in ('asymmetric_gjsd', 'bidirectional_gjsd'):
+                    return (gene_name, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+                else:
+                    return (gene_name, 0.0)
             
-            # =====================================================================
-            # CLOSED-FORM G-JSD FOR UNIVARIATE GAUSSIANS (Proposition 3)
-            # G-JSD = (1/2) * Jeffreys - Bhattacharyya
-            # =====================================================================
+            # --- KL Divergences (for direction) ---
+            kl_1_2 = (np.log(np.sqrt(v2/v1)) + (v1 + (mu1 - mu2)**2) / (2*v2) - 0.5)
+            kl_2_1 = (np.log(np.sqrt(v1/v2)) + (v2 + (mu2 - mu1)**2) / (2*v1) - 0.5)
             
-            # --- Jeffreys Divergence ---
-            # J(P,Q) = (1/2)(σ₁²/σ₂² + σ₂²/σ₁² - 2) + (1/2)(μ₁-μ₂)²(1/σ₁² + 1/σ₂²)
-            variance_ratio_term = 0.5 * (v1/v2 + v2/v1 - 2.0)
-            mean_diff_term = 0.5 * (mu1 - mu2)**2 * (1.0/v1 + 1.0/v2)
-            jeffreys = variance_ratio_term + mean_diff_term
+            # --- Jeffreys (symmetric) ---
+            jeffreys = kl_1_2 + kl_2_1
             
-            # --- Bhattacharyya Distance ---
-            # B(P,Q) = (μ₁-μ₂)²/(4(σ₁²+σ₂²)) + (1/2)log((σ₁²+σ₂²)/(2√(σ₁²σ₂²)))
+            # --- Bhattacharyya ---
             var_sum = v1 + v2
-            bhattacharyya = (
-                (mu1 - mu2)**2 / (4.0 * var_sum) +
-                0.5 * np.log(var_sum / (2.0 * np.sqrt(v1 * v2)))
-            )
+            bhattacharyya = ((mu1 - mu2)**2 / (4.0 * var_sum) +
+                           0.5 * np.log(var_sum / (2.0 * np.sqrt(v1 * v2))))
             
-            # --- G-JSD (Proposition 3) ---
-            if method == 'gaussian_gjsd':
-                gjsd = 0.5 * jeffreys - bhattacharyya
-            else:  # 'extended_gjsd'
-                # Extended G-JSD (Proposition 4) - same formula for probability densities
-                gjsd = 0.5 * jeffreys - bhattacharyya
+            # --- G-JSD Magnitude ---
+            if method == 'extended_gjsd':
+                gjsd_magnitude = 0.25 * jeffreys + np.exp(-bhattacharyya) - 1.0
+            else:
+                gjsd_magnitude = 0.25 * jeffreys - bhattacharyya
             
-            # Ensure non-negative
-            gjsd = max(0.0, gjsd)
+            gjsd_magnitude = max(0.0, gjsd_magnitude) if np.isfinite(gjsd_magnitude) else 0.0
             
-            if not np.isfinite(gjsd):
-                gjsd = 0.0
-            
-            # Scale by n_target for API compatibility
-            # HIGH gjsd = HIGH specificity
-            score_sum = (1/gjsd) * n_target
-            
-            return gene_name, float(score_sum)
+            # --- Return based on method ---
+            if method in ('asymmetric_gjsd', 'bidirectional_gjsd'):
+                # Direction: positive = target-specific, negative = other-specific
+                direction = kl_1_2 - kl_2_1
+                signed_specificity = np.sign(direction) * gjsd_magnitude
+                
+                # Normalized specificity scores (0-1)
+                kl_sum = kl_1_2 + kl_2_1 + eps
+                specificity_target = kl_1_2 / kl_sum
+                specificity_other = kl_2_1 / kl_sum
+                
+                # Ensure finite
+                direction = direction if np.isfinite(direction) else 0.0
+                signed_specificity = signed_specificity if np.isfinite(signed_specificity) else 0.0
+                specificity_target = specificity_target if np.isfinite(specificity_target) else 0.5
+                specificity_other = specificity_other if np.isfinite(specificity_other) else 0.5
+                
+                return (gene_name, 
+                        float(gjsd_magnitude),
+                        float(direction),
+                        float(signed_specificity),
+                        float(kl_1_2),
+                        float(kl_2_1),
+                        float(specificity_target),
+                        float(specificity_other))
+            else:
+                # Simple methods: magnitude only
+                return (gene_name, float(gjsd_magnitude))
 
         # =========================================================================
         # ORIGINAL PER-CELL DISCRETE METHODS (preserved for backward compatibility)
@@ -715,58 +721,42 @@ class BaseTFIdentityPipeline(ABC):
 
 
 
-    # ========================================================================
-    # MULTIPROCESSING METHOD
-    # ========================================================================
-    
+# =============================================================================
+# STEP 2: Update multiprocess_jsd to handle tuple results (Lines 722-783)
+# =============================================================================
+
     def multiprocess_jsd(self, genes: List[str], method: str = 'jsd') -> Dict[str, float]:
         """
         Compute JSD scores for multiple genes using multiprocessing.
         
-        Args:
-            genes: List of gene names
-            method: Divergence method ('jsd', 'bhattacharyya', 'geometric_jsd')
-            
         Returns:
-            Dictionary of gene to JSD score
+            For simple methods: Dict[gene, score]
+            For directional methods: Dict[gene, tuple of scores]
         """
-        # Prepare data for parallel processing
         gene_data_list = []
-        
-        # Check if using Gaussian methods that need variance
-        use_gaussian = method in ('gaussian_gjsd', 'extended_gjsd')
+        use_gaussian = method in ('gaussian_gjsd', 'extended_gjsd', 'asymmetric_gjsd', 'bidirectional_gjsd')
         
         for gene in genes:
             if gene not in self.adata.var_names:
                 continue
             
             gene_idx = np.where(self.adata.var_names == gene)[0][0]
-            
-            # Extract expression for this gene
             target_expr = self.X_target[:, gene_idx]
             mu_other = self.mu_other_all[gene_idx]
             
             if use_gaussian:
-                # Include variance for Gaussian closed-form methods
                 var_other = self.var_other_all[gene_idx]
                 gene_data_list.append((gene, target_expr, self.n_target, mu_other, var_other))
             else:
-                # Original 4-tuple format
                 gene_data_list.append((gene, target_expr, self.n_target, mu_other))
         
         if not gene_data_list:
             return {}
         
-        # Create partial function with fixed method
         compute_func = partial(self._compute_jsd_single_gene_parallel, method=method)
-        
-        # Parallel computation
-        if self.verbose:
-            print(f"    Using {self.n_processes} processes for {len(gene_data_list)} genes...")
         
         with Pool(processes=self.n_processes) as pool:
             if self.verbose:
-                # With progress bar
                 results = list(tqdm(
                     pool.imap(compute_func, gene_data_list, chunksize=self.chunk_size),
                     total=len(gene_data_list),
@@ -774,13 +764,15 @@ class BaseTFIdentityPipeline(ABC):
                     disable=False
                 ))
             else:
-                # Without progress bar
                 results = pool.map(compute_func, gene_data_list, chunksize=self.chunk_size)
         
         # Convert to dictionary
-        jsd_scores = dict(results)
-        
-        return jsd_scores
+        # For directional methods, keep the full tuple
+        if method in ('asymmetric_gjsd', 'bidirectional_gjsd'):
+            return {r[0]: r[1:] for r in results}  # gene: (mag, dir, signed, kl1, kl2, st, so)
+        else:
+            return dict(results)  # gene: score
+
     
     # Enhanced multiprocess method for MMD
     def multiprocess_mmd(self, genes: List[str]) -> Dict[str, float]:
@@ -833,6 +825,78 @@ class BaseTFIdentityPipeline(ABC):
         scores = dict(results)
         
         return scores
+
+# =============================================================================
+# STEP 3: Add helper method to convert to DataFrame (NEW - add after line 835)
+# =============================================================================
+
+    def gjsd_to_dataframe(self, gjsd_results: Dict, method: str) -> pd.DataFrame:
+        """
+        Convert GJSD results to pandas DataFrame with proper columns.
+        
+        Args:
+            gjsd_results: Output from multiprocess_jsd()
+            method: The method used ('gaussian_gjsd', 'asymmetric_gjsd', etc.)
+            
+        Returns:
+            DataFrame with appropriate columns and sorted by specificity
+        """
+        if method in ('asymmetric_gjsd', 'bidirectional_gjsd'):
+            # Unpack tuples
+            data = []
+            for gene, values in gjsd_results.items():
+                mag, direction, signed, kl_t_o, kl_o_t, spec_t, spec_o = values
+                data.append({
+                    'gene': gene,
+                    'gjsd_score': mag,
+                    'direction': direction,
+                    'signed_specificity': signed,
+                    'kl_target_other': kl_t_o,
+                    'kl_other_target': kl_o_t,
+                    'specificity_target': spec_t,
+                    'specificity_other': spec_o
+                })
+            
+            df = pd.DataFrame(data)
+            
+            # Add mean expression
+            df['mean_target'] = df['gene'].map(
+                lambda g: self.adata[self.target_mask, g].X.mean() 
+                if g in self.adata.var_names else 0
+            )
+            df['mean_other'] = df['gene'].map(
+                lambda g: self.adata[self.other_mask, g].X.mean() 
+                if g in self.adata.var_names else 0
+            )
+            
+            df = df.set_index('gene')
+            
+            # Sort by absolute signed specificity (most specific genes on top)
+            df['abs_specificity'] = df['signed_specificity'].abs()
+            df = df.sort_values('abs_specificity', ascending=False)
+            
+        else:
+            # Simple methods
+            df = pd.DataFrame([
+                {'gene': gene, 'gjsd_score': score}
+                for gene, score in gjsd_results.items()
+            ])
+            
+            # Add mean expression
+            df['mean_target'] = df['gene'].map(
+                lambda g: self.adata[self.target_mask, g].X.mean() 
+                if g in self.adata.var_names else 0
+            )
+            df['mean_other'] = df['gene'].map(
+                lambda g: self.adata[self.other_mask, g].X.mean() 
+                if g in self.adata.var_names else 0
+            )
+            
+            df = df.set_index('gene')
+            df = df.sort_values('gjsd_score', ascending=False)
+        
+        return df    
+
     # ========================================================================
     # CORE FILTERING METHODS (High Expression & Uniqueness)
     # ========================================================================
@@ -1051,42 +1115,33 @@ class BaseTFIdentityPipeline(ABC):
         
         return threshold
 
+    # COMPLETE FIX FOR filter_unique_expression
+    # Replace lines 1118-1218 in base_filter.py
+
     def filter_unique_expression(
         self, 
         tfs: Optional[List[str]] = None,
         jsd_threshold: float = None,
-        jsd_thresh_method: str = 'iqr',  # NEW: method for auto threshold
+        jsd_thresh_method: str = 'iqr',
         top_n: int = None,
         top_percentile: float = None,
         use_parallel: bool = True
     ) -> List[str]:
         """
         Filter TFs with unique expression pattern using divergence measures.
-        NOTE: Lower JSD values indicate higher specificity to target cell type.
-        
-        Args:
-            tfs: List of TFs to evaluate (if None, uses all TFs)
-            jsd_threshold: Absolute threshold (if None, auto-compute using jsd_method)
-            jsd_method: Method for auto threshold ('iqr', 'mad', 'top_n_percent')
-            top_n: Select top N TFs by score (lowest scores)
-            top_percentile: Select top percentile of TFs (e.g., 75 for lowest 25%)
-            use_parallel: Whether to use parallel processing
-            
-        Returns:
-            List of TF names with unique expression
         """
         method = self.jsd_method
         top_percentile = self.top_jsd_pc 
         if tfs is None:
             tfs = self.tf_list
         
-        # Filter to TFs present in data
         tfs_present = [tf for tf in tfs if tf in self.adata.var_names]
         
         if self.verbose:
             print(f"  Computing {method} divergence for {len(tfs_present)} TFs...")
+        
         if method != 'mmd':
-            if use_parallel and len(tfs_present) > 20:  # Only parallelize if worth it
+            if use_parallel and len(tfs_present) > 20:
                 scores = self.multiprocess_jsd(tfs_present, method=method)
                 self.results['jsd_scores'] = scores
         else:
@@ -1094,55 +1149,69 @@ class BaseTFIdentityPipeline(ABC):
                 scores = self.multiprocess_mmd(tfs_present)
                 self.results['jsd_scores'] = scores
 
-        # Sort TFs by score - ASCENDING order (lower is better/more specific)
-        sorted_tfs = sorted(self.results['jsd_scores'].items(), key=lambda x: x[1], reverse=False)
+        # Handle directional vs simple methods
+        is_directional = method in ('asymmetric_gjsd', 'bidirectional_gjsd')
         
-        # Apply filtering based on provided criteria
+        if is_directional:
+            # After r[1:], tuple is: (mag, dir, signed, kl1, kl2, spec_target, spec_other)
+            #                indices:  0    1    2      3    4    5            6
+            
+            filtered_scores = {}
+            for gene, values in self.results['jsd_scores'].items():
+                signed_specificity = values[2]  # index 2
+                specificity_target = values[5]   # index 5 ← CORRECTED!
+                
+                # Filter for target-specific only
+                if signed_specificity > 0 and specificity_target > 0.55:
+                    filtered_scores[gene] = signed_specificity
+            
+            if self.verbose:
+                total = len(self.results['jsd_scores'])
+                kept = len(filtered_scores)
+                print(f"  Directional filtering: {kept}/{total} genes are target-specific")
+            
+            sorted_tfs = sorted(filtered_scores.items(), key=lambda x: x[1], reverse=True)
+            
+        else:
+            sorted_tfs = sorted(self.results['jsd_scores'].items(), key=lambda x: x[1], reverse=False)
+        
+        # Apply filtering criteria
         unique_tfs = []
         
         if jsd_threshold is not None:
-            # Use absolute threshold - select scores BELOW threshold
-            unique_tfs = [tf for tf, score in sorted_tfs if score <= jsd_threshold]
+            if is_directional:
+                unique_tfs = [tf for tf, score in sorted_tfs if score >= jsd_threshold]
+            else:
+                unique_tfs = [tf for tf, score in sorted_tfs if score <= jsd_threshold]
             if self.verbose:
-                print(f"  {method} <= {jsd_threshold}: {len(unique_tfs)} TFs")
+                print(f"  {method} threshold {jsd_threshold}: {len(unique_tfs)} TFs")
         
         elif top_n is not None:
-            # Select top N (lowest scores)
             unique_tfs = [tf for tf, score in sorted_tfs[:min(top_n, len(sorted_tfs))]]
             if self.verbose and sorted_tfs:
                 max_score = sorted_tfs[min(top_n-1, len(sorted_tfs)-1)][1]
-                print(f"  Top {top_n} TFs ({method} <= {max_score:.3f})")
+                print(f"  Top {top_n} TFs (score: {max_score:.3f})")
         
         elif top_percentile is not None:
-            # Select top percentile (lowest scores)
             n_select = int(len(sorted_tfs) * (100 - top_percentile) / 100)
-            n_select = max(1, n_select)  # At least 1
+            n_select = max(1, n_select)
             unique_tfs = [tf for tf, score in sorted_tfs[:n_select]]
             if self.verbose and sorted_tfs:
                 max_score = sorted_tfs[min(n_select-1, len(sorted_tfs)-1)][1]
-                print(f"  Top {100-top_percentile}% TFs: {len(unique_tfs)} ({method} <= {max_score:.3f})")
+                print(f"  Top {100-top_percentile}% TFs: {len(unique_tfs)} (score: {max_score:.3f})")
         
         else:
-
-            # # Default: use data-driven statistical threshold
             if sorted_tfs:
-            #     scores_array = np.array([score for _, score in sorted_tfs])
+                if not is_directional:
+                    unique_tfs = self._compute_jsd_zscores(dict(sorted_tfs), method='geometric_jsd')
+                    unique_tfs = [tf for tf, zscore in unique_tfs.items() if zscore <= -2.0]
+                else:
+                    # For directional, take top 20% (already filtered for positive)
+                    n_select = max(1, len(sorted_tfs) // 5)
+                    unique_tfs = [tf for tf, score in sorted_tfs[:n_select]]
                 
-            #     # Use the simple threshold finder
-            #     threshold = self._find_jsd_threshold_simple(scores_array, method=jsd_thresh_method)
-                # all_jsd_scores = self.multiprocess_jsd(self.tf_list, method='geometric_jsd')
-                # all_jsd_scores_df = pd.Series(all_jsd_scores).reset_index()
-                # all_jsd_scores_df = all_jsd_scores_df[all_jsd_scores_df[0] >= 1]
-                # self.all_jsd_scores_df = all_jsd_scores_df
-                # threshold = np.percentile(all_jsd_scores_df[0], 10)
-                # self.threshold = round(threshold,2)
-                # unique_tfs = [tf for tf, score in sorted_tfs if score <= threshold]
-                unique_tfs = self._compute_jsd_zscores(dict(sorted_tfs), method='geometric_jsd')
-                unique_tfs = [tf for tf, zscore in unique_tfs.items() if zscore <= -2.0]
-                # if len(unique_tfs) < 3:
-                #     unique_tfs = [tf for tf, score in sorted_tfs[:max(1, int(0.1*len(sorted_tfs)))]]
                 if self.verbose:
-                    print(f"  Data-driven threshold ({jsd_thresh_method}): {len(unique_tfs)} TFs selected")
+                    print(f"  Data-driven threshold: {len(unique_tfs)} TFs selected")
             else:
                 unique_tfs = []
         
@@ -1150,7 +1219,8 @@ class BaseTFIdentityPipeline(ABC):
             print(f"  Unique expression TFs: {len(unique_tfs)}/{len(tfs_present)}")
             if sorted_tfs:
                 top_5 = sorted_tfs[:min(5, len(sorted_tfs))]
-                print(f"  Top 5 by {method} (most specific): {', '.join([f'{tf}({score:.2f})' for tf, score in top_5])}")    
+                print(f"  Top 5 by {method}: {', '.join([f'{tf}({score:.2f})' for tf, score in top_5])}")
+        
         return unique_tfs
     
     def _compute_jsd_zscores(self, sorted_tfs, method: str = 'geometric_jsd') -> float:
@@ -1533,7 +1603,86 @@ class BaseTFIdentityPipeline(ABC):
         
         X = adata_subset.X.toarray() if issparse(adata_subset.X) else adata_subset.X
         return X, genes_present
-    
+
+    def get_directional_scores_df(self) -> pd.DataFrame:
+        """
+        Convert bidirectional GJSD results to a clean DataFrame.
+        
+        Only works with asymmetric_gjsd or bidirectional_gjsd methods.
+        
+        Returns:
+            DataFrame with columns:
+            - gjsd_score (magnitude)
+            - direction  
+            - signed_specificity
+            - kl_target_other
+            - kl_other_target
+            - specificity_target (0-1, higher = more target-specific)
+            - specificity_other (0-1, higher = more background-specific)
+            - mean_target
+            - mean_other
+            
+            Indexed by gene name, sorted by abs(signed_specificity) descending
+        """
+        if self.jsd_method not in ('asymmetric_gjsd', 'bidirectional_gjsd'):
+            raise ValueError(
+                f"This method only works with directional methods. "
+                f"Current method: {self.jsd_method}"
+            )
+        
+        if 'jsd_scores' not in self.results or not self.results['jsd_scores']:
+            raise ValueError("No JSD scores found. Run the pipeline first.")
+        
+        # After r[1:] in multiprocess_jsd, tuple structure is:
+        # (magnitude, direction, signed_specificity, kl_target_other, kl_other_target, specificity_target, specificity_other)
+        #  index 0    index 1   index 2             index 3          index 4          index 5              index 6
+        
+        data = []
+        for gene, values in self.results['jsd_scores'].items():
+            # Unpack tuple with correct indices
+            magnitude = values[0]
+            direction = values[1]
+            signed_specificity = values[2]
+            kl_target_other = values[3]
+            kl_other_target = values[4]
+            specificity_target = values[5]  # ← Correct index!
+            specificity_other = values[6]    # ← Correct index!
+            
+            # Get mean expression for this gene
+            if gene in self.adata.var_names:
+                gene_idx = list(self.adata.var_names).index(gene)
+                mean_target = self.X_target[:, gene_idx].mean() if hasattr(self, 'X_target') else 0
+                mean_other = self.mu_other_all[gene_idx] if hasattr(self, 'mu_other_all') else 0
+            else:
+                mean_target = 0
+                mean_other = 0
+            
+            data.append({
+                'gene': gene,
+                'gjsd_score': magnitude,
+                'direction': direction,
+                'signed_specificity': signed_specificity,
+                'kl_target_other': kl_target_other,
+                'kl_other_target': kl_other_target,
+                'specificity_target': specificity_target,
+                'specificity_other': specificity_other,
+                'mean_target': mean_target,
+                'mean_other': mean_other
+            })
+        
+        # Create DataFrame
+        df = pd.DataFrame(data)
+        df = df.set_index('gene')
+        
+        # Add helper column for sorting
+        df['abs_specificity'] = df['signed_specificity'].abs()
+        
+        # Sort by absolute signed specificity (most divergent on top)
+        df = df.sort_values('abs_specificity', ascending=False)
+        
+        return df
+
+
     # def compute_all_divergence_metrics(
     #     self, 
     #     adata: AnnData,
