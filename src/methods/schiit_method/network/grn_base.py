@@ -33,7 +33,12 @@ class StageIIICoreIdentifier:
         unique_genes: Optional[List[str]] = None,
         high_exp_genes: Optional[List[str]] = None,
         use_collectri: bool = True,
-        verbose: bool = True
+        verbose: bool = True,
+        # NEW parameters for connecting TF selection
+        jsd_scores: Optional[Dict] = None,                    # JSD scores from Stage I/II
+        connecting_selection_method: str = 'top_percent',     # 'top_percent', 'top_n', 'all'
+        connecting_top_percent: float = 1.0,                  # Default: top 1%
+        connecting_top_n: int = None,                         # Alternative: top N
     ):
         """
         Initialize Stage III Core Identifier.
@@ -53,7 +58,10 @@ class StageIIICoreIdentifier:
         self.high_exp_genes = set(high_exp_genes) if high_exp_genes else set()
         self.verbose = verbose
         self.use_collectri = use_collectri
-        
+        self.jsd_scores = jsd_scores
+        self.connecting_selection_method = connecting_selection_method
+        self.connecting_top_percent = connecting_top_percent
+        self.connecting_top_n = connecting_top_n
         # Results storage
         self.pkn_network = None
         self.connecting_tfs = set()
@@ -121,14 +129,15 @@ class StageIIICoreIdentifier:
         
         return literature_net
     
+    # REPLACE the identify_connecting_tfs method (lines 124-187) with this enhanced version:
     def identify_connecting_tfs(self) -> Set[str]:
         """
-        Identify non-unique TFs that connect unique TFs.
+        Identify non-unique TFs that connect unique TFs, optionally filtered by score.
         
         A non-unique TF is selected if:
         - It has at least one unique TF as a source (regulating it)
         - It has at least one unique TF as a target (it regulates)
-        - Source and target can be the same unique TF
+        - [NEW] It ranks in top X% by JSD score (if filtering enabled)
         
         Returns:
             Set of connecting TF names
@@ -146,11 +155,57 @@ class StageIIICoreIdentifier:
             print(f"  Unique TFs: {len(self.unique_tfs)}")
             print(f"  Non-unique TFs to evaluate: {len(non_unique_tfs)}")
         
+        # ========================================================================
+        # NEW: Pre-filter non-unique TFs by score if scores are available
+        # ========================================================================
+        candidate_tfs = non_unique_tfs
+        
+        if hasattr(self, 'jsd_scores') and self.jsd_scores:
+            # Get connecting selection parameters (with defaults)
+            selection_method = getattr(self, 'connecting_selection_method', 'top_percent')
+            top_percent = getattr(self, 'connecting_top_percent', 1.0)
+            top_n = getattr(self, 'connecting_top_n', None)
+            
+            # Rank non-unique TFs by score
+            scored_tfs = []
+            for tf in non_unique_tfs:
+                if tf in self.jsd_scores:
+                    score = self.jsd_scores[tf]
+                    # Handle tuple (directional) vs float (simple)
+                    if isinstance(score, tuple):
+                        score_val = abs(score[2])  # Use abs(signed_specificity)
+                    else:
+                        score_val = score
+                    scored_tfs.append((tf, score_val))
+            
+            if scored_tfs and selection_method != 'all':
+                # Determine sort order
+                is_directional = isinstance(list(self.jsd_scores.values())[0], tuple)
+                reverse = is_directional  # directional: high=better, simple: low=better
+                
+                # Sort
+                ranked = sorted(scored_tfs, key=lambda x: x[1], reverse=reverse)
+                
+                # Select top subset
+                if selection_method == 'top_percent':
+                    n_select = max(1, int(len(ranked) * top_percent / 100))
+                    candidate_tfs = set([tf for tf, _ in ranked[:n_select]])
+                    if self.verbose:
+                        print(f"  Pre-filtered to top {top_percent}% = {n_select} non-unique TFs by score")
+                
+                elif selection_method == 'top_n' and top_n:
+                    n_select = min(top_n, len(ranked))
+                    candidate_tfs = set([tf for tf, _ in ranked[:n_select]])
+                    if self.verbose:
+                        print(f"  Pre-filtered to top {n_select} non-unique TFs by score")
+        
+        # ========================================================================
+        # Original connectivity check (on filtered candidates)
+        # ========================================================================
         connecting = set()
         tf_connections = defaultdict(lambda: {'sources': set(), 'targets': set()})
         
-        # For each non-unique TF, check if it connects unique TFs
-        for tf in non_unique_tfs:
+        for tf in candidate_tfs:
             # Find unique TFs that regulate this TF (sources)
             sources = self.pkn_network[
                 (self.pkn_network['target'] == tf) &
@@ -173,16 +228,16 @@ class StageIIICoreIdentifier:
         self.tf_connections = tf_connections
         
         if self.verbose:
-            print(f"  Found {len(connecting)} connecting TFs")
+            print(f"  Found {len(connecting)} connecting TFs (after connectivity check)")
             
             # Show examples
             if len(connecting) > 0:
-                print(f"\n  Example connections (first 5):")
-                for i, tf in enumerate(list(connecting)[:5]):
+                print(f"\n  Example connections (first 3):")
+                for i, tf in enumerate(list(connecting)[:3]):
                     conn = tf_connections[tf]
                     print(f"    {tf}:")
-                    print(f"      Sources (unique TFs): {list(conn['sources'])[:3]}")
-                    print(f"      Targets (unique TFs): {list(conn['targets'])[:3]}")
+                    print(f"      Sources: {list(conn['sources'])[:3]}")
+                    print(f"      Targets: {list(conn['targets'])[:3]}")
         
         return connecting
     
@@ -519,15 +574,18 @@ class StageIIICoreIdentifier:
 
 
 def run_stage_iii(
-
     tf_results: Dict,
     gene_results: Dict,
     chipseq_file: str,
     selection_method: str = 'largest',
     min_scc_size: int = 2,
     output_dir: Optional[str] = None,
-    high_exp_tfs: List[str]= None,
-    verbose: bool = True
+    high_exp_tfs: List[str] = None,
+    verbose: bool = True,
+    # NEW parameters
+    connecting_selection_method: str = 'top_percent',
+    connecting_top_percent: float = 1.0,
+    connecting_top_n: int = None
 ) -> Dict:
     """
     Convenience function to run Stage III on results from Stage I/II.
@@ -552,24 +610,35 @@ def run_stage_iii(
         ... )
         >>> core_tfs = results_stage3['core_tfs']
     """
+    # Extract JSD scores
+    jsd_scores = tf_results.get('jsd_scores', None)
     if high_exp_tfs is None or len(high_exp_tfs) == 0:
-
         identifier = StageIIICoreIdentifier(
-            unique_tfs=tf_results['core_filtered_tfs'],
+            unique_tfs=tf_results['identity_tfs'],
             high_exp_tfs=tf_results['high_exp_tfs'],
             chipseq_file=chipseq_file,
-            unique_genes=gene_results.get('core_filtered_tfs', []),
+            unique_genes=gene_results.get('identity_tfs', []),
             high_exp_genes=gene_results.get('high_exp_tfs', []),
-            verbose=verbose
+            verbose=verbose,
+            # NEW
+            jsd_scores=jsd_scores,
+            connecting_selection_method=connecting_selection_method,
+            connecting_top_percent=connecting_top_percent,
+            connecting_top_n=connecting_top_n
         )
     else:
         identifier = StageIIICoreIdentifier(
-            unique_tfs=tf_results['core_filtered_tfs'],
+            unique_tfs=tf_results['identity_tfs'],
             high_exp_tfs=high_exp_tfs,
             chipseq_file=chipseq_file,
-            unique_genes=gene_results.get('core_filtered_tfs', []),
+            unique_genes=gene_results.get('identity_tfs', []),
             high_exp_genes=gene_results.get('high_exp_tfs', []),
-            verbose=verbose
+            verbose=verbose,
+            # NEW
+            jsd_scores=jsd_scores,
+            connecting_selection_method=connecting_selection_method,
+            connecting_top_percent=connecting_top_percent,
+            connecting_top_n=connecting_top_n
         )
             
     results = identifier.run_full_pipeline(

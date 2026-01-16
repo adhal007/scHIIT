@@ -48,7 +48,9 @@ class BaseTFIdentityPipeline(ABC):
         n_processes: int = None,
         top_n_high: int = 100,
         top_jsd_pc: float = 0.05,
-        top_n_jsd: int = 50
+        top_n_jsd: int = 50,
+        identity_top_percent: float = None,     # e.g., 10.0 for top 10%
+        identity_top_n: int = None,             # e.g., 50 for top 50 TFs
     ):
         """
         Initialize base pipeline.
@@ -76,6 +78,8 @@ class BaseTFIdentityPipeline(ABC):
         self.top_n_high = top_n_high
         self.top_jsd_pc = top_jsd_pc
         self.top_n_jsd = top_n_jsd
+        self.identity_top_percent = identity_top_percent  # <-- ADD THIS
+        self.identity_top_n = identity_top_n              # <-- ADD THIS
         # Parallel processing settings
         self.n_processes = n_processes or min(cpu_count() - 1, 8)
         self.chunk_size = 10  # Process genes in chunks
@@ -1681,25 +1685,4 @@ class BaseTFIdentityPipeline(ABC):
         df = df.sort_values('abs_specificity', ascending=False)
         
         return df
-
-
-    # def compute_all_divergence_metrics(
-    #     self, 
-    #     adata: AnnData,
-    #     gene: str,
-    #     target_cell_type: str,
-    #     cell_type_key: str = 'cell_type'
-    # ) -> dict:
-    #     """
-    #     Compute all divergence metrics for comparison.
-        
-    #     Returns:
-    #         Dictionary with 'jsd', 'bhattacharyya', and 'geometric_jsd' scores
-    #     """
-    #     return {
-    #         'jsd': self._compute_jsd_specificity(adata, gene, target_cell_type, cell_type_key, method='jsd'),
-    #         'bhattacharyya': self._compute_jsd_specificity(adata, gene, target_cell_type, cell_type_key, method='bhattacharyya'),
-    #         'geometric_jsd': self._compute_jsd_specificity(adata, gene, target_cell_type, cell_type_key, method='geometric_jsd')
-    #     }
-
     

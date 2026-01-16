@@ -45,10 +45,22 @@ class CoreFilterOnlyPipeline(tf_base.BaseTFIdentityPipeline):
             # Sort by score
             ranked = sorted(tf_scores, key=lambda x: x[1], reverse=False)
             
-            # Return top 20 or 20% (whichever is larger)
-            n_select = max(20, len(ranked) // 5)
+            # Use configurable selection method
+            if hasattr(self, 'identity_top_percent') and self.identity_top_percent is not None:
+                # Use percentage
+                n_select = max(1, int(len(ranked) * self.identity_top_percent / 100))
+            elif hasattr(self, 'identity_top_n') and self.identity_top_n is not None:
+                # Use absolute number
+                n_select = min(self.identity_top_n, len(ranked))
+            else:
+                # Default: top 20 or 20% (whichever is larger) - preserves old behavior
+                n_select = max(20, len(ranked) // 5)
+
             selected_tfs = [tf for tf, _ in ranked[:n_select]]
-            
+
+            if self.verbose:
+                print(f"  Identity TF selection: {len(selected_tfs)} TFs")
+                        
             # if self.verbose:
             #     print(f"  Selected top {len(selected_tfs)} TFs by JSD score")
             #     print(f"  Score range: {ranked[0][1]:.3f} - {ranked[n_select-1][1]:.3f}")
