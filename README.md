@@ -36,3 +36,16 @@ scHIIT/
 ├── LICENSE
 └── requirements.txt
 ```
+
+## 2. Usage
+The repository is currently in private mode - request access by emailing abhilash.dhal@uni.lu
+
+- Install the repository 
+
+```git clone https://github.com/adhal007/scHIIT.git```
+
+- Create conda environment for env_generic.yml 
+
+```conda env create -f env_generic.yml```
+
+- Run the first demo notebook in ~/demo_nb/
