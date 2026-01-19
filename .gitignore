@@ -1,5 +1,5 @@
 *data
-*scripts*
+*cluster_scripts*
 *.sh*
 *.log*
 *.err* 
