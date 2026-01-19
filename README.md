@@ -34,7 +34,7 @@ scHIIT/
 │
 ├── README.md
 ├── LICENSE
-└── requirements.txt
+└── env_generic.yml
 ```
 
 ## 2. Usage
@@ -47,5 +47,8 @@ The repository is currently in private mode - request access by emailing abhilas
 - Create conda environment for env_generic.yml 
 
 ```conda env create -f env_generic.yml```
+```conda activate schiit_main```
 
-- Run the first demo notebook in ~/demo_nb/
+- Run the first demo notebook in 
+
+```demo_nb/scHIIT_pipeline_v0.1.3_main.ipynb```
