@@ -1,0 +1,9 @@
+sphinx>=5.0
+sphinx-rtd-theme
+sphinx-autodoc-typehints
+numpy
+pandas
+matplotlib
+scipy
+networkx
+scikit-learn
