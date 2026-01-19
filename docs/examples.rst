@@ -239,10 +239,11 @@ Discover related cell types at the same hierarchical level:
 .. warning::
    The harmonizer automatically filters out functional parent classifications to ensure biological coherence. Cell types like neurons will NOT be mapped to "electrically responsive cell" but will follow their biological lineage.
 
+
 3. Complete scHIIT Pipeline
 ============================
 
-This example demonstrates the end-to-end scHIIT pipeline for gene regulatory network (GRN) inference from single-cell data.
+This example demonstrates the end-to-end scHIIT pipeline for gene regulatory network (GRN) inference from single-cell data using the three-stage approach.
 
 3.1 Setup and Load Packages
 ----------------------------
@@ -254,6 +255,7 @@ This example demonstrates the end-to-end scHIIT pipeline for gene regulatory net
     import numpy as np
     import sys
     import os
+    from UniProtMapper import ProtMapper
     from importlib import reload
     
     # Add project root to path
@@ -278,219 +280,331 @@ The scHIIT pipeline requires both query data (your dataset of interest) and refe
 .. code-block:: python
 
     # Load reference data (single nuclei background)
-    ref_data_path = "path/to/reference_nuclei.h5ad"
+    ref_data_path = "/path/to/ref_nuclei.h5ad"
     ref_adata = sc.read_h5ad(ref_data_path)
     
     # Load query data (your dataset of interest)
-    query_data_path = "path/to/query_data.h5ad"
+    query_data_path = "/path/to/query_data.h5ad"
     query_adata = sc.read_h5ad(query_data_path)
-    
-    # Important: Ensure adata.var_names are in GENE NAME format, not ENSEMBL ID
 
-3.3 Harmonize and Merge Query + Reference
-------------------------------------------
+.. important::
+   Ensure ``adata.var_names`` are in GENE NAME format (e.g., "FOXP2"), NOT ENSEMBL ID format (e.g., "ENSG00000128573").
 
-Merge query and reference datasets while preserving metadata:
+3.3 Fix Query Variable Names and Merge Datasets
+------------------------------------------------
+
+Fix variable names and merge query with reference data:
 
 .. code-block:: python
 
     import src.io.seattle_ad.query_ref_merge as query_ref_merge
     
-    # Merge datasets with proper harmonization
-    merged_adata = query_ref_merge.merge_query_reference(
-        query_adata=query_adata,
-        ref_adata=ref_adata,
-        cluster_key="cluster_name"  # Column with cell type annotations
+    # Fix query variable names (converts ENSEMBL IDs to gene names if needed)
+    query_adata_fixed = query_ref_merge.fix_query_var_names(query_adata)
+    
+    # Merge query and reference datasets
+    merged_adata = query_ref_merge.merge_query_reference_simple(
+        query_adata=query_adata_fixed,
+        reference_adata=ref_adata,
+        query_cluster_key='Class',  # Options: 'Class', 'Subclass', 'Supertype'
+        batch_key='dataset'
     )
     
-    # The merge function:
-    # 1. Finds common genes between query and reference
-    # 2. Adds metadata distinguishing query vs reference cells
-    # 3. Preserves query-specific metadata (e.g., disease status, donor info)
-    # 4. Aligns gene metadata
-    # 5. Creates unified dataset with proper labeling
+    # Verify the merge
+    query_ref_merge.verify_merge(merged_adata, batch_key='dataset')
     
-    print(f"Total cells: {merged_adata.n_obs:,}")
-    print(f"Total genes: {merged_adata.n_vars:,}")
-    print(f"Query cells: {(merged_adata.obs['dataset'] == 'query').sum():,}")
-    print(f"Reference cells: {(merged_adata.obs['dataset'] == 'reference').sum():,}")
+    print("\nMerged data ready for benchmarking! ✓")
+    
+    # Optional: Save merged data
+    # merged_adata.write('merged_data.h5ad')
+    
+    # Clean up
+    del query_adata_fixed
 
-3.4 Initialize JSD Filter
---------------------------
+The merge function performs the following:
 
-Create the Jensen-Shannon Divergence filter for identifying TF-target relationships:
+- Finds common genes between query and reference
+- Adds metadata distinguishing query vs reference cells
+- Preserves query-specific metadata (e.g., disease status, donor info)
+- Aligns gene metadata
+- Creates unified dataset with proper labeling
+
+3.4 Create Memory-Safe Subset
+------------------------------
+
+For large datasets, create a memory-safe subset by subsampling background cells:
 
 .. code-block:: python
 
-    # Initialize JSD filter with merged data
-    jsd_filter = schiit_main.JSDFilter(
-        adata=merged_adata,
-        cluster_key="cluster_name",  # Column with cell type labels
-        background_cluster="background"  # Label for reference cells
-    )
+    import numpy as np
+    import gc
+    from scipy.sparse import csr_matrix, issparse
     
-    # The JSD filter computes:
-    # - Gene expression distributions per cluster
-    # - Jensen-Shannon divergence between query and background
-    # - TF-specific and target-specific filters
+    def create_subset(adata, target_ct, max_background=20000):
+        """
+        Create a subset with target cells and sampled background cells.
+        
+        Parameters
+        ----------
+        adata : AnnData
+            Full merged dataset
+        target_ct : str
+            Target cell type (e.g., 'Neuronal: GABAergic')
+        max_background : int
+            Maximum number of background cells to keep
+        
+        Returns
+        -------
+        AnnData
+            Subsetted dataset
+        """
+        target_mask = adata.obs['Class'] == target_ct
+        background_mask = adata.obs['Class'] == 'background'
+        
+        target_idx = np.where(target_mask)[0]
+        background_idx = np.where(background_mask)[0]
+        
+        # Subsample background if too large
+        if len(background_idx) > max_background:
+            np.random.seed(42)
+            background_idx = np.random.choice(
+                background_idx, max_background, replace=False
+            )
+        
+        keep_idx = np.concatenate([target_idx, background_idx])
+        subset = adata[keep_idx, :].copy()
+        
+        # Ensure sparse matrix format
+        if not issparse(subset.X):
+            subset.X = csr_matrix(subset.X)
+        
+        return subset
+    
+    # Create subset for your target cell type
+    ct = 'Neuronal: GABAergic'
+    adata_safe = create_subset(merged_adata, ct, max_background=50000)
 
-3.5 Compute TF-Target Interactions
------------------------------------
+3.5 Stage I + II: Core TF Filtering Pipeline
+---------------------------------------------
 
-Run the filter to identify significant TF-target pairs:
+Run Stages I and II to identify core transcription factors using bidirectional GJSD:
 
 .. code-block:: python
 
-    # Define your transcription factors of interest
-    tfs_of_interest = ["FOXP2", "MEF2C", "NEUROD6", "TBR1", "SATB2"]
+    # Load TF list
+    tf_df = pd.read_csv(
+        '/path/to/Homo_sapiens_TF.txt', 
+        sep='\t'
+    )
+    tf_name_list = tf_df['Symbol'].to_list()
     
-    # Compute JSD-filtered interactions
-    filtered_interactions = jsd_filter.filter_tf_targets(
-        tfs=tfs_of_interest,
-        clusters=["Neuronal: Glutamatergic", "Neuronal: GABAergic"],
-        jsd_threshold=0.1,  # Minimum JSD threshold
-        expr_threshold=0.5  # Minimum expression threshold
+    # Initialize results storage
+    results = {}
+    stageI_II_tfs = {}
+    
+    # Set method
+    method = 'bidirectional_gjsd'
+    
+    # Initialize Core Filter Pipeline
+    neuro_top_tf = schiit_main.CoreFilterOnlyPipeline(
+        adata=adata_safe,
+        tf_list=tf_name_list,
+        target_cell_type=ct,
+        background_cell_type='background',
+        cell_type_key='Class',
+        chipseq_file=None,
+        verbose=True,
+        scgx_sig_file='/path/to/sig_frames/Neuronal: GABAergic_sig_tbl.txt',
+        main_filter='high_and_unique',
+        jsd_method=method,
+        top_n_high=None,
+        top_jsd_pc=None,
+        top_n_jsd=1000,
+        expr_method='scgx',
+        identity_top_percent=10.0,  # Top 10% for identity
     )
     
-    # Results include:
-    # - TF name
-    # - Target gene
-    # - Cluster
-    # - JSD score
-    # - Expression levels
-    # - Statistical significance
+    # Run the pipeline
+    neuro_top_tf.run()
+    
+    # Store results
+    results[method] = neuro_top_tf.results
+    stageI_II_tfs[method] = neuro_top_tf.results['core_filtered_tfs']
+    
+    # Clean up memory
+    del adata_safe
+    gc.collect()
 
-3.6 Build Gene Regulatory Network
-----------------------------------
+**Key Parameters:**
 
-Construct the GRN from filtered interactions:
+- ``main_filter``: Filtering strategy ('high_and_unique', 'unique_only', etc.)
+- ``jsd_method``: Method for computing divergence ('bidirectional_gjsd', 'forward_gjsd', etc.)
+- ``top_n_jsd``: Number of top genes to keep based on JSD score
+- ``identity_top_percent``: Top percentage for identity scoring
+- ``expr_method``: Expression method ('scgx', 'mean', 'median')
+
+3.6 Examine Directional GJSD Results
+-------------------------------------
+
+Analyze the directional generalized Jensen-Shannon Divergence scores:
 
 .. code-block:: python
 
-    # Initialize GRN builder
-    grn_builder = schiit_grn.GRNBuilder()
+    # Get full directional DataFrame
+    df = neuro_top_tf.get_directional_scores_df()
     
-    # Build network from filtered interactions
-    grn = grn_builder.build_network(
-        interactions=filtered_interactions,
-        cluster="Neuronal: Glutamatergic"
-    )
+    print("\n=== Directional GJSD Results ===")
+    print(df.head(10))
     
-    # Analyze network properties
-    network_stats = grn_builder.compute_network_statistics(grn)
-    print(f"Nodes: {network_stats['n_nodes']}")
-    print(f"Edges: {network_stats['n_edges']}")
-    print(f"Density: {network_stats['density']:.4f}")
-    print(f"Average degree: {network_stats['avg_degree']:.2f}")
+    # Filter for TARGET-SPECIFIC genes
+    target_specific = df[
+        (df['signed_specificity'] > 0) &           # Positive direction
+        (df['specificity_target'] > 0.65) &        # High confidence
+        (df['gjsd_score'] > 1.0)                   # Minimum divergence
+    ].sort_values('signed_specificity', ascending=False)
+    
+    print(f"\nTarget-specific genes: {len(target_specific)}")
+    print(target_specific[[
+        'gjsd_score', 'direction', 'specificity_target',
+        'mean_target', 'mean_other'
+    ]].head(20))
+    
+    # Filter for BACKGROUND-SPECIFIC genes
+    background_specific = df[
+        (df['signed_specificity'] < 0) &
+        (df['specificity_other'] > 0.65) &
+        (df['gjsd_score'] > 1.0)
+    ].sort_values('signed_specificity', ascending=True)
+    
+    print(f"\nBackground-specific genes: {len(background_specific)}")
 
-3.7 Visualize the Network
---------------------------
+3.7 Visualize Top Target-Specific Genes
+----------------------------------------
 
-Create visualizations of the inferred GRN:
+Create a tracks plot to visualize expression of top target-specific genes:
 
 .. code-block:: python
 
     import matplotlib.pyplot as plt
     
-    # Create network visualization
-    fig, ax = plt.subplots(figsize=(15, 15))
+    # Set font sizes
+    plt.rcParams['font.size'] = 14
+    plt.rcParams['axes.titlesize'] = 16
+    plt.rcParams['axes.labelsize'] = 14
+    plt.rcParams['xtick.labelsize'] = 12
+    plt.rcParams['ytick.labelsize'] = 12
+    plt.rcParams['legend.fontsize'] = 12
     
-    grn_builder.plot_network(
-        grn=grn,
-        cluster="Neuronal: Glutamatergic",
-        layout="spring",  # or "kamada_kawai", "circular"
-        node_size_by="degree",
-        color_by="module",
-        show_labels=True,
-        ax=ax
+    # Plot top 20 target-specific genes
+    ax = sc.pl.tracksplot(
+        merged_adata,
+        target_specific.index.values[:20],
+        groupby="batch_source",
+        dendrogram=False,
+        figsize=(15, 8),
+        show=False
     )
-    
-    plt.tight_layout()
-    plt.savefig("grn_glutamatergic.pdf", dpi=300, bbox_inches='tight')
     plt.show()
 
-3.8 Export Results
--------------------
+3.8 Stage III: Build Core Transcriptional Network
+--------------------------------------------------
 
-Save your results for downstream analysis:
-
-.. code-block:: python
-
-    # Export filtered interactions to CSV
-    filtered_interactions.to_csv(
-        "schiit_filtered_interactions.csv",
-        index=False
-    )
-    
-    # Export network in various formats
-    grn_builder.export_network(
-        grn=grn,
-        output_path="schiit_grn",
-        formats=["graphml", "edgelist", "gml"]
-    )
-    
-    # Save network statistics
-    with open("network_stats.json", "w") as f:
-        import json
-        json.dump(network_stats, f, indent=2)
-
-3.9 Compare Across Clusters
-----------------------------
-
-Compare GRNs across different cell type clusters:
+Run Stage III to construct the core gene regulatory network using ChIP-seq data:
 
 .. code-block:: python
 
-    clusters = ["Neuronal: Glutamatergic", "Neuronal: GABAergic"]
+    import src.methods.schiit_method.network.grn_base as schiit_grn
+    reload(schiit_grn)
     
-    # Build networks for each cluster
-    grn_dict = {}
-    for cluster in clusters:
-        interactions = jsd_filter.filter_tf_targets(
-            tfs=tfs_of_interest,
-            clusters=[cluster],
-            jsd_threshold=0.1
-        )
-        grn_dict[cluster] = grn_builder.build_network(interactions, cluster)
+    # Path to ChIP-seq data
+    chip_seq_file = '/path/to/Chip_removed_overlapped_peaks.tsv'
     
-    # Compare network properties
-    comparison = grn_builder.compare_networks(grn_dict)
-    
-    # Visualize comparison
-    fig, axes = plt.subplots(1, len(clusters), figsize=(20, 8))
-    for ax, (cluster, grn) in zip(axes, grn_dict.items()):
-        grn_builder.plot_network(grn, cluster, ax=ax)
-    plt.tight_layout()
-    plt.savefig("grn_comparison.pdf", dpi=300, bbox_inches='tight')
+    # Run Stage III
+    stage3_results = schiit_grn.run_stage_iii(
+        tf_results=results['bidirectional_gjsd'],
+        gene_results=results['bidirectional_gjsd'],
+        chipseq_file=chip_seq_file,
+        selection_method='largest',
+        min_scc_size=2,
+        verbose=True,
+        connecting_top_percent=100  # Use top 1% for connecting TFs
+    )
 
-3.10 Advanced: Custom Filtering Parameters
--------------------------------------------
+**Stage III performs:**
 
-Fine-tune the filtering parameters for your specific use case:
+1. Filters TFs and genes based on Stages I and II
+2. Constructs TF-target interactions using ChIP-seq evidence
+3. Builds directed graph of regulatory relationships
+4. Identifies strongly connected components (SCCs)
+5. Selects core transcriptional network
+
+**Key Parameters:**
+
+- ``selection_method``: How to select core network ('largest', 'highest_degree', etc.)
+- ``min_scc_size``: Minimum size for strongly connected components
+- ``connecting_top_percent``: Percentage of top connecting TFs to include
+
+3.9 Visualize Core Network
+---------------------------
+
+Plot the final core transcriptional network:
 
 .. code-block:: python
 
-    # Custom filter with multiple thresholds
-    filtered_interactions = jsd_filter.filter_tf_targets(
-        tfs=tfs_of_interest,
-        clusters=["Neuronal: Glutamatergic"],
-        jsd_threshold=0.15,        # Higher JSD threshold
-        expr_threshold=0.5,        # Minimum expression
-        specificity_threshold=0.3, # Cluster specificity
-        top_n_per_tf=100,          # Keep top 100 targets per TF
-        remove_housekeeping=True   # Filter out housekeeping genes
+    import src.io.plotting_utils as putils
+    
+    # Plot core network
+    putils.plot_core_network(stage3_results)
+
+The visualization shows:
+
+- Nodes representing TFs and target genes
+- Edges representing regulatory relationships
+- Node colors indicating modules or functional groups
+- Node sizes proportional to connectivity or importance
+
+3.10 Optional: Run Pipeline for All Genes
+------------------------------------------
+
+You can also run the pipeline for all genes (not just TFs) to identify regulated targets:
+
+.. code-block:: python
+
+    # Create gene list (excluding TFs)
+    gene_list = list(set(adata_safe.var_names) - set(tf_name_list))
+    
+    # Initialize pipeline for genes
+    results_genes = {}
+    stageI_II_genes = {}
+    
+    neuro_top_genes = schiit_main.CoreFilterOnlyPipeline(
+        adata=adata_safe,
+        tf_list=gene_list,  # Use gene list instead of TF list
+        target_cell_type=ct,
+        background_cell_type='background',
+        cell_type_key='Class',
+        chipseq_file=None,
+        verbose=True,
+        scgx_sig_file='/path/to/sig_frames/Neuronal: GABAergic_sig_tbl.txt',
+        main_filter='unique_only',
+        jsd_method=method,
+        top_n_high=700,
+        top_jsd_pc=None,
+        top_n_jsd=30,
+        expr_method='scgx',
     )
     
-    # Apply additional biological filters
-    filtered_interactions = jsd_filter.apply_biological_filters(
-        interactions=filtered_interactions,
-        known_interactions_db="path/to/known_interactions.csv",
-        require_known=False,  # Don't require known interactions
-        penalize_unknown=True # But penalize completely unknown pairs
-    )
+    # Run pipeline
+    neuro_top_genes.run()
+    results_genes[method] = neuro_top_genes.results
+    stageI_II_genes[method] = neuro_top_genes.results['core_filtered_tfs']
+    
+    # Clean up
+    del adata_safe
+    gc.collect()
 
 .. tip::
-   The scHIIT method uses Jensen-Shannon Divergence to identify TF-target pairs that show differential expression patterns between your query cells and background reference cells. Higher JSD scores indicate stronger specificity to your cell type of interest.
+   The three-stage scHIIT pipeline progressively refines the network: Stage I identifies highly expressed genes, Stage II applies bidirectional GJSD filtering to find cell-type-specific genes, and Stage III constructs the core regulatory network using ChIP-seq evidence.
 
 Summary
 =======
@@ -504,7 +618,7 @@ These examples demonstrate the three main capabilities of the SCHIIT toolkit:
 For more detailed information on each module, see the :doc:`api/modules` documentation.
 
 .. seealso::
-   - :doc:`installation` - Setup instructions
+   - :doc:`getting_started`` - Setup instructions
    - :doc:`quickstart` - Quick introduction to basic usage
-   - :doc:`api/modules` - Complete API reference
-   - :doc:`references` - Citation information
+..    - :doc:`api/modules` - Complete API reference
+..    - :doc:`references` - Citation information
