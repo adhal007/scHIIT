@@ -1,14 +1,16 @@
-SCHIIT Documentation
+scHIIT Documentation
 ====================
 
-Welcome to SCHIIT project documentation.
+Welcome to scHIIT project documentation. scHIIT is built to provide a computational tool for accurately identifying the identity core for single cell data.
+The goal is to utilize advanced feature selection + networks in order to infer regulatory mechanisms.
 
 .. toctree::
    :maxdepth: 2
    :caption: Contents:
 
-   installation
+   getting_started
    quickstart
+   examples
 
 Installation
 ============
@@ -17,13 +19,6 @@ Installation
 
    conda env create -f env_generic.yml
    conda activate schiit_main
-
-Quick Start
-===========
-
-.. code-block:: python
-
-   import src.methods.schiit_method as schiit
 
 Indices and tables
 ==================
