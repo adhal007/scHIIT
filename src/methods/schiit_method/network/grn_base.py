@@ -93,25 +93,42 @@ class StageIIICoreIdentifier:
             if self.verbose:
                 print(f"  ChIP-seq edges: {len(pkn_chip)}")
             edges.append(pkn_chip)
-        
+
         # CollecTRI
         if self.use_collectri:
             if self.verbose:
                 print("\nLoading CollecTRI...")
             try:
                 import decoupler as dc
-                ct = dc.op.collectri(organism='human')
-                
-                collectri = ct[ct['sign_decision'] == 'default activation']
+                    
+                #handle both old and new decoupler API
+                try:
+                    ct = dc.get_collectri(organism='human')  #new API (>=1.4)
+                except AttributeError:
+                    ct = dc.op.collectri(organism='human')   #old API
+                    
+                #handle both old and new dataframe structures
+                if 'sign_decision' in ct.columns:
+                    #old format: filter by sign_decision
+                    collectri = ct[ct['sign_decision'] == 'default activation']
+                elif 'weight' in ct.columns:
+                    #new format: filter by positive weight
+                    collectri = ct[ct['weight'] > 0]
+                else:
+                    #fallback: use all edges
+                    collectri = ct
+                    
                 pkn_collectri = collectri[['source', 'target']].copy()
                 pkn_collectri['evidence'] = 'collectri'
-                
+                    
                 if self.verbose:
                     print(f"  CollecTRI edges: {len(pkn_collectri)}")
                 edges.append(pkn_collectri)
+                    
             except Exception as e:
                 if self.verbose:
-                    print(f"  ⚠ CollecTRI failed: {e}")
+                    print(f"  ⚠ CollecTRI failed: {e}")       
+
         
         if len(edges) == 0:
             raise ValueError("No literature network!")
