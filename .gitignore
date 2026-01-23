@@ -14,3 +14,6 @@ __pycache__/
 *owl*
 *personal*
 *csv*
+*_static*
+*_templates*
+*_build*
