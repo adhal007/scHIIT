@@ -17,3 +17,4 @@ __pycache__/
 *_static*
 *_templates*
 *_build*
+*backup*
