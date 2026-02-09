@@ -36,30 +36,41 @@ class CoreFilterOnlyPipeline(tf_base.BaseTFIdentityPipeline):
         No network-based selection.
         """
         # Use JSD scores to rank TFs
+        # Use JSD scores to rank TFs
         if 'jsd_scores' in self.results and self.results['jsd_scores']:
             scores = self.results['jsd_scores']
             
             # Get scores for filtered TFs
             tf_scores = [(tf, scores.get(tf, 0)) for tf in filtered_tfs]
             
-            # Sort by score
-            ranked = sorted(tf_scores, key=lambda x: x[1], reverse=False)
+            # ============================================================
+            # FIX: Sort direction depends on method type
+            # ============================================================
+            # For bidirectional/asymmetric: higher signed_specificity = better
+            # For symmetric methods (jsd, bhattacharyya): lower divergence = better
+            
+            if self.jsd_method in ('bidirectional_gjsd', 'asymmetric_gjsd'):
+                # Higher is better - sort DESCENDING
+                ranked = sorted(tf_scores, key=lambda x: x[1], reverse=True)
+            else:
+                # Lower is better - sort ASCENDING  
+                ranked = sorted(tf_scores, key=lambda x: x[1], reverse=False)
             
             # Use configurable selection method
             if hasattr(self, 'identity_top_percent') and self.identity_top_percent is not None:
-                # Use percentage
                 n_select = max(1, int(len(ranked) * self.identity_top_percent / 100))
             elif hasattr(self, 'identity_top_n') and self.identity_top_n is not None:
-                # Use absolute number
                 n_select = min(self.identity_top_n, len(ranked))
             else:
-                # Default: top 20 or 20% (whichever is larger) - preserves old behavior
                 n_select = max(20, len(ranked) // 5)
 
             selected_tfs = [tf for tf, _ in ranked[:n_select]]
-
+            
             if self.verbose:
                 print(f"  Identity TF selection: {len(selected_tfs)} TFs")
+                if ranked:
+                    print(f"  Top 5 selected: {', '.join(selected_tfs[:5])}")
+                    print(f"  Score range: {ranked[0][1]:.3f} - {ranked[n_select-1][1]:.3f}")
                         
             # if self.verbose:
             #     print(f"  Selected top {len(selected_tfs)} TFs by JSD score")

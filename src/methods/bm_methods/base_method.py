@@ -1,360 +1,242 @@
 """
-Base class for benchmarking cell identity methods.
+Base class for benchmark feature selection methods.
 
-This provides a unified interface for all marker gene selection methods
-to ensure consistent evaluation and comparison.
+All benchmark methods inherit from this base class to ensure
+consistent interface with the GJSD pipeline for fair comparison.
+
+This is separate from src.methods.schiit_method.tf_filters.base_filter
+to keep benchmarking code isolated.
 """
 
-from abc import ABC, abstractmethod
-from typing import List, Dict, Optional, Union
 import numpy as np
 import pandas as pd
 from anndata import AnnData
-import logging
+from scipy.sparse import issparse
+from typing import Dict, List, Optional
+import time
+import warnings
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+warnings.filterwarnings('ignore')
 
 
-class BaseBenchmarkMethod(ABC):
+class BaseBenchmarkMethod:
     """
-    Abstract base class for cell identity / marker gene selection methods.
+    Base class for benchmark feature selection methods.
     
-    All benchmarking methods should inherit from this class and implement
-    the required abstract methods.
-    
-    Parameters
-    ----------
-    method_name : str
-        Name of the method (e.g., 'COSG', 'Wilcoxon', 'NS-Forest')
-    params : dict, optional
-        Method-specific parameters
-        
-    Attributes
-    ----------
-    method_name : str
-        Name of the method
-    params : dict
-        Method parameters
-    results_ : dict
-        Stores results after calling find_markers()
+    Matches the interface of CoreFilterOnlyPipeline to enable fair comparison.
+    All benchmark methods should inherit from this class.
     """
     
     def __init__(
         self,
-        method_name: str,
-        params: Optional[Dict] = None
+        adata: AnnData,
+        tf_list: List[str],
+        target_cell_type: str,
+        background_cell_type: str,
+        cell_type_key: str = 'cell_type',
+        verbose: bool = True,
+        top_n_high: int = None,
+        top_n_jsd: int = 1000,
+        identity_top_percent: float = 10.0,
+        identity_top_n: int = None,
     ):
-        self.method_name = method_name
-        self.params = params if params is not None else {}
-        self.results_ = {}
+        """
+        Initialize benchmark method.
         
-        logger.info(f"Initialized {self.method_name} with params: {self.params}")
+        Args:
+            adata: AnnData object with expression data
+            tf_list: List of TF/gene names to select from
+            target_cell_type: Target cell type for feature selection
+            background_cell_type: Background/reference cell type
+            cell_type_key: Column in adata.obs with cell type labels
+            verbose: Print progress messages
+            top_n_high: Number of top expressed features (for high expression filter)
+            top_n_jsd: Number of features after uniqueness filter (matches GJSD pipeline)
+            identity_top_percent: Percentage of top features for identity selection
+            identity_top_n: Absolute number of identity features (overrides percent)
+        """
+        # Core data
+        self.adata = adata
+        self.tf_list = tf_list
+        self.target_cell_type = target_cell_type
+        self.background_cell_type = background_cell_type
+        self.cell_type_key = cell_type_key
+        self.verbose = verbose
+        
+        # Selection parameters (match GJSD pipeline)
+        self.top_n_high = top_n_high
+        self.top_n_jsd = top_n_jsd
+        self.identity_top_percent = identity_top_percent
+        self.identity_top_n = identity_top_n
+        
+        # Extract cell masks
+        self.target_mask = adata.obs[cell_type_key] == target_cell_type
+        self.background_mask = adata.obs[cell_type_key] == background_cell_type
+        
+        # Get expression matrices
+        X = adata.X
+        self.X = X.toarray() if issparse(X) else X.copy()
+        self.X_target = self.X[self.target_mask, :]
+        self.X_background = self.X[self.background_mask, :]
+        
+        # Get gene indices and names for TFs
+        self.tf_indices = [i for i, g in enumerate(adata.var_names) if g in tf_list]
+        self.tf_names = [adata.var_names[i] for i in self.tf_indices]
+        
+        # Results storage (matches GJSD pipeline structure)
+        self.results = {
+            'high_exp_tfs': None,
+            'unique_exp_tfs': None,
+            'core_filtered_tfs': None,
+            'final_filtered_tfs': None,
+            'network': None,
+            'identity_tfs': None,
+            'feature_scores': {},  # Store raw scores
+            'jsd_scores': {},      # Renamed scores for compatibility
+            'metrics': {}
+        }
+        
+        if self.verbose:
+            self._print_initialization()
     
-    @abstractmethod
-    def find_markers(
-        self,
-        adata: AnnData,
-        query_key: str,
-        query_clusters: Optional[List[str]] = None,
-        background_key: Optional[str] = None,
-        n_genes: int = 50,
-        **kwargs
-    ) -> pd.DataFrame:
+    def run(self):
         """
-        Find marker genes for query clusters relative to background.
+        Run the feature selection pipeline.
         
-        This is the main method that each implementation must define.
+        This method orchestrates the full pipeline:
+        1. Compute feature scores
+        2. Rank features
+        3. Apply filters
+        4. Select identity TFs
         
-        Parameters
-        ----------
-        adata : AnnData
-            Merged AnnData object containing both query and background cells
-        query_key : str
-            Key in adata.obs that identifies query clusters
-            Example: 'cell_type' where values are 'VIP', 'SST', etc.
-        query_clusters : list of str, optional
-            Specific clusters to find markers for. If None, use all clusters.
-        background_key : str, optional
-            Key in adata.obs to identify background cells.
-            Example: 'dataset' where background cells have value 'background'
-            If None, use all non-query cells as background.
-        n_genes : int, default=50
-            Number of top marker genes to return per cluster
-        **kwargs
-            Method-specific additional arguments
-            
-        Returns
-        -------
-        pd.DataFrame
-            DataFrame with columns:
-            - 'cluster': query cluster name
-            - 'gene': gene name
-            - 'score': marker score (higher = better marker)
-            - 'rank': rank within cluster (1 = best)
-            - Additional method-specific columns
-            
-        Notes
-        -----
-        The returned DataFrame should be sorted by cluster and rank.
+        Returns:
+            self.results dictionary
         """
-        pass
-    
-    def _validate_inputs(
-        self,
-        adata: AnnData,
-        query_key: str,
-        background_key: Optional[str] = None
-    ) -> None:
-        """
-        Validate input parameters.
+        start_time = time.time()
         
-        Parameters
-        ----------
-        adata : AnnData
-            Input data
-        query_key : str
-            Query cluster key
-        background_key : str, optional
-            Background key
-            
-        Raises
-        ------
-        ValueError
-            If inputs are invalid
-        """
-        if query_key not in adata.obs.columns:
-            raise ValueError(f"query_key '{query_key}' not found in adata.obs")
+        if self.verbose:
+            print(f"\n{'='*80}")
+            print(f"RUNNING: {self.__class__.__name__}")
+            print('='*80)
         
-        if background_key is not None and background_key not in adata.obs.columns:
-            raise ValueError(f"background_key '{background_key}' not found in adata.obs")
+        # Step 1: Compute scores for all TFs
+        scores = self.compute_scores()
+        self.results['feature_scores'] = scores
         
-        logger.info(f"Input validation passed for {self.method_name}")
-    
-    def _get_query_background_split(
-        self,
-        adata: AnnData,
-        query_key: str,
-        cluster: str,
-        background_key: Optional[str] = None
-    ) -> tuple[AnnData, AnnData]:
-        """
-        Split data into query cluster cells and background cells.
+        # Step 2: Rank features by scores
+        ranked_tfs = self.rank_features(scores)
         
-        Parameters
-        ----------
-        adata : AnnData
-            Full dataset
-        query_key : str
-            Key identifying clusters
-        cluster : str
-            Specific cluster to extract
-        background_key : str, optional
-            If provided, use this to identify background cells
-            If None, use all cells not in the query cluster
-            
-        Returns
-        -------
-        query_adata : AnnData
-            Cells from the query cluster
-        background_adata : AnnData
-            Background cells
-        """
-        # Get query cluster cells
-        query_mask = adata.obs[query_key] == cluster
-        query_adata = adata[query_mask].copy()
-        
-        # Get background cells
-        if background_key is not None:
-            # Use explicit background key
-            background_mask = adata.obs[background_key] == 'background'
-            background_adata = adata[background_mask].copy()
+        # Step 3: Apply high expression filter (if specified)
+        if self.top_n_high is not None:
+            high_exp_tfs = ranked_tfs[:self.top_n_high]
+            self.results['high_exp_tfs'] = high_exp_tfs
+            if self.verbose:
+                print(f"  High expression filter: {len(high_exp_tfs)} TFs")
         else:
-            # Use all non-query cells
-            background_mask = ~query_mask
-            background_adata = adata[background_mask].copy()
+            high_exp_tfs = ranked_tfs
+            self.results['high_exp_tfs'] = high_exp_tfs
         
-        logger.info(f"Split for cluster '{cluster}': "
-                   f"{query_adata.n_obs} query cells, "
-                   f"{background_adata.n_obs} background cells")
+        # Step 4: Apply uniqueness/specificity filter
+        # For baselines, this is the same as high expression
+        # (they don't have separate uniqueness filter like GJSD)
+        self.results['unique_exp_tfs'] = high_exp_tfs
         
-        return query_adata, background_adata
+        # Step 5: Core filtered TFs (intersection for GJSD, same for baselines)
+        n_core = min(self.top_n_jsd, len(high_exp_tfs)) if self.top_n_jsd else len(high_exp_tfs)
+        core_filtered_tfs = high_exp_tfs[:n_core]
+        self.results['core_filtered_tfs'] = core_filtered_tfs
+        
+        if self.verbose:
+            print(f"  Core filtered TFs: {len(core_filtered_tfs)}")
+        
+        # Step 6: Final filtered (no additional filtering for baselines)
+        self.results['final_filtered_tfs'] = core_filtered_tfs
+        
+        # Step 7: Select identity TFs (top percentage)
+        if self.identity_top_n is not None:
+            n_identity = min(self.identity_top_n, len(core_filtered_tfs))
+        elif self.identity_top_percent is not None:
+            n_identity = max(1, int(len(core_filtered_tfs) * self.identity_top_percent / 100))
+        else:
+            n_identity = max(20, len(core_filtered_tfs) // 5)  # Default: top 20%
+        
+        identity_tfs = core_filtered_tfs[:n_identity]
+        self.results['identity_tfs'] = identity_tfs
+        
+        if self.verbose:
+            print(f"  Identity TFs selected: {len(identity_tfs)}")
+        
+        # Step 8: Store scores in GJSD-compatible format
+        # Convert to dict with gene names as keys for compatibility
+        self.results['jsd_scores'] = {gene: scores[gene] for gene in self.tf_names if gene in scores}
+        
+        # Compute metrics
+        runtime = time.time() - start_time
+        self.results['metrics'] = self._compute_metrics(runtime)
+        
+        if self.verbose:
+            self._print_summary()
+        
+        return self.results
     
-    def _format_results(
-        self,
-        results_dict: Dict[str, pd.DataFrame],
-        n_genes: int
-    ) -> pd.DataFrame:
+    def compute_scores(self) -> Dict[str, float]:
         """
-        Format method-specific results into standardized DataFrame.
+        Compute feature scores.
         
-        Parameters
-        ----------
-        results_dict : dict
-            Dictionary mapping cluster names to DataFrames with marker info
-        n_genes : int
-            Number of top genes to keep per cluster
-            
-        Returns
-        -------
-        pd.DataFrame
-            Standardized results DataFrame
+        MUST BE IMPLEMENTED BY SUBCLASSES.
+        
+        Returns:
+            Dictionary mapping gene names to scores.
+            Higher scores = more important features.
         """
-        all_results = []
-        
-        for cluster, df in results_dict.items():
-            # Ensure required columns exist
-            if 'gene' not in df.columns:
-                raise ValueError(f"Results for cluster {cluster} missing 'gene' column")
-            if 'score' not in df.columns:
-                raise ValueError(f"Results for cluster {cluster} missing 'score' column")
-            
-            # Add cluster column
-            df = df.copy()
-            df['cluster'] = cluster
-            
-            # Sort by score (descending) and add rank
-            df = df.sort_values('score', ascending=False)
-            df['rank'] = range(1, len(df) + 1)
-            
-            # Keep top n_genes
-            df = df.head(n_genes)
-            
-            all_results.append(df)
-        
-        # Concatenate all clusters
-        final_df = pd.concat(all_results, ignore_index=True)
-        
-        # Reorder columns: cluster, gene, score, rank, then others
-        cols = ['cluster', 'gene', 'score', 'rank']
-        other_cols = [c for c in final_df.columns if c not in cols]
-        final_df = final_df[cols + other_cols]
-        
-        return final_df
+        raise NotImplementedError("Subclasses must implement compute_scores()")
     
-    def score_gene_list(
-        self,
-        adata: AnnData,
-        gene_list: List[str],
-        query_key: str,
-        cluster: str,
-        background_key: Optional[str] = None
-    ) -> pd.DataFrame:
+    def rank_features(self, scores: Dict[str, float]) -> List[str]:
         """
-        Score a predefined list of genes for a specific cluster.
+        Rank features by scores.
         
-        This is useful for evaluating known marker genes or comparing
-        across methods.
+        Args:
+            scores: Dictionary of gene -> score
         
-        Parameters
-        ----------
-        adata : AnnData
-            Merged dataset
-        gene_list : list of str
-            Genes to score
-        query_key : str
-            Query cluster key
-        cluster : str
-            Specific cluster
-        background_key : str, optional
-            Background identifier
-            
-        Returns
-        -------
-        pd.DataFrame
-            Scores for the provided genes
+        Returns:
+            List of gene names sorted by score (descending)
         """
-        # This is optional - subclasses can override if they have
-        # efficient ways to score specific genes
-        raise NotImplementedError(
-            f"{self.method_name} does not implement score_gene_list(). "
-            "Run find_markers() instead."
-        )
+        sorted_genes = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        return [gene for gene, score in sorted_genes]
     
-    def get_params(self) -> Dict:
-        """Get method parameters."""
-        return self.params.copy()
+    def _compute_metrics(self, runtime: float) -> Dict:
+        """Compute metrics matching GJSD pipeline."""
+        metrics = {
+            'runtime': runtime,
+            'n_input_tfs': len(self.tf_list),
+            'n_high_exp': len(self.results['high_exp_tfs'] or []),
+            'n_unique_exp': len(self.results['unique_exp_tfs'] or []),
+            'n_core_filtered': len(self.results['core_filtered_tfs'] or []),
+            'n_final_filtered': len(self.results['final_filtered_tfs'] or []),
+            'n_identity_tfs': len(self.results['identity_tfs'] or [])
+        }
+        return metrics
     
-    def set_params(self, **params) -> None:
-        """Set method parameters."""
-        self.params.update(params)
-        logger.info(f"Updated {self.method_name} params: {params}")
+    def _print_initialization(self):
+        """Print initialization info."""
+        print("="*80)
+        print(f"INITIALIZED: {self.__class__.__name__}")
+        print("="*80)
+        print(f"Target cell type: {self.target_cell_type}")
+        print(f"Background cell type: {self.background_cell_type}")
+        print(f"Target cells: {self.target_mask.sum()}")
+        print(f"Background cells: {self.background_mask.sum()}")
+        print(f"Total cells: {self.adata.n_obs}")
+        print(f"Input TFs: {len(self.tf_list)}")
     
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(method_name='{self.method_name}', params={self.params})"
-
-
-# Example of how a concrete implementation would look:
-class ExampleMethod(BaseBenchmarkMethod):
-    """
-    Example implementation showing the interface.
-    
-    This is just for illustration - not a real method.
-    """
-    
-    def __init__(self, params: Optional[Dict] = None):
-        super().__init__(method_name="Example", params=params)
-    
-    def find_markers(
-        self,
-        adata: AnnData,
-        query_key: str,
-        query_clusters: Optional[List[str]] = None,
-        background_key: Optional[str] = None,
-        n_genes: int = 50,
-        **kwargs
-    ) -> pd.DataFrame:
-        """Find markers using the example method."""
-        # Validate inputs
-        self._validate_inputs(adata, query_key, background_key)
+    def _print_summary(self):
+        """Print pipeline results summary."""
+        m = self.results['metrics']
         
-        # Get clusters to process
-        if query_clusters is None:
-            query_clusters = adata.obs[query_key].unique()
-        
-        results_dict = {}
-        
-        # Process each cluster
-        for cluster in query_clusters:
-            logger.info(f"Processing cluster: {cluster}")
-            
-            # Get query and background split
-            query_adata, background_adata = self._get_query_background_split(
-                adata, query_key, cluster, background_key
-            )
-            
-            # === METHOD-SPECIFIC LOGIC GOES HERE ===
-            # Example: simple fold-change calculation
-            query_mean = np.array(query_adata.X.mean(axis=0)).flatten()
-            background_mean = np.array(background_adata.X.mean(axis=0)).flatten()
-            
-            # Avoid division by zero
-            background_mean = np.maximum(background_mean, 1e-10)
-            fold_change = query_mean / background_mean
-            
-            # Create results DataFrame
-            cluster_results = pd.DataFrame({
-                'gene': adata.var_names,
-                'score': fold_change,
-                'query_mean': query_mean,
-                'background_mean': background_mean
-            })
-            # === END METHOD-SPECIFIC LOGIC ===
-            
-            results_dict[cluster] = cluster_results
-        
-        # Format and return results
-        final_results = self._format_results(results_dict, n_genes)
-        self.results_ = final_results
-        
-        return final_results
-
-
-# if __name__ == "__main__":
-#     # Quick test of the base class design
-#     print("Base class design loaded successfully!")
-    
-#     # Show what the interface looks like
-#     example = ExampleMethod(params={'threshold': 0.5})
-#     print(example)
-#     print(f"Parameters: {example.get_params()}")
+        print("\n" + "="*80)
+        print("RESULTS SUMMARY")
+        print("="*80)
+        print(f"  Input TFs:        {m['n_input_tfs']:4d}")
+        print(f"  Core filtered:    {m['n_core_filtered']:4d}")
+        print(f"  Identity TFs:     {m['n_identity_tfs']:4d}")
+        print(f"  Runtime:          {m['runtime']:.2f}s")

@@ -1165,10 +1165,12 @@ class BaseTFIdentityPipeline(ABC):
                 signed_specificity = values[2]  # index 2
                 specificity_target = values[5]   # index 5 ← CORRECTED!
                 
-                # Filter for target-specific only
-                if signed_specificity > 0 and specificity_target > 0.55:
+                # # Filter for target-specific only
+                # if signed_specificity > 0 and specificity_target > 0.0:
+                #     filtered_scores[gene] = signed_specificity
+                if signed_specificity > 0:
                     filtered_scores[gene] = signed_specificity
-            
+                    
             if self.verbose:
                 total = len(self.results['jsd_scores'])
                 kept = len(filtered_scores)
