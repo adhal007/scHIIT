@@ -121,25 +121,28 @@ class CoreFilterOnlyPipeline(tf_base.BaseTFIdentityPipeline):
         else:
             scores = self.results['jsd_scores']
             
-            # Get scores for filtered TFs
-            tf_scores = [(tf, scores.get(tf, 0)) for tf in filtered_tfs]
+            # Create DataFrame from scores
+            jsd_scores_df = pd.Series(scores).reset_index()
+            jsd_scores_df.columns = ['gene', 'jsd_score']
             
-            # Sort by score (ascending for JSD - lower divergence is more similar)
-            ranked = sorted(tf_scores, key=lambda x: x[1], reverse=False)
+            # Filter to jsd_score > 1 and sort descending
+            jsd_scores_df = jsd_scores_df[jsd_scores_df['jsd_score'] > 1].sort_values(
+                'jsd_score', ascending=True
+            )
             
             # Determine how many to select
             if hasattr(self, 'identity_top_percent') and self.identity_top_percent is not None:
-                n_select = max(1, int(len(ranked) * self.identity_top_percent / 100))
+                n_select = max(1, int(len(jsd_scores_df) * self.identity_top_percent / 100))
             elif hasattr(self, 'identity_top_n') and self.identity_top_n is not None:
-                n_select = min(self.identity_top_n, len(ranked))
+                n_select = min(self.identity_top_n, len(jsd_scores_df))
             else:
-                n_select = max(20, len(ranked) // 5)
+                n_select = max(20, len(jsd_scores_df) // 5)
 
-            selected_tfs = [tf for tf, _ in ranked[:n_select]]
+            selected_tfs = jsd_scores_df.head(n_select)['gene'].tolist()
 
             if self.verbose:
-                print(f"  Identity TF selection: {len(selected_tfs)} TFs")
-                if ranked and n_select > 0:
-                    print(f"  Score range: {ranked[0][1]:.3f} - {ranked[n_select-1][1]:.3f}")
+                print(f"  Identity TF selection: {len(selected_tfs)} TFs (from {len(jsd_scores_df)} with JSD > 1)")
+                if len(selected_tfs) > 0:
+                    print(f"  Score range: {jsd_scores_df.iloc[0]['jsd_score']:.3f} - {jsd_scores_df.iloc[min(n_select-1, len(jsd_scores_df)-1)]['jsd_score']:.3f}")
             
             return selected_tfs
