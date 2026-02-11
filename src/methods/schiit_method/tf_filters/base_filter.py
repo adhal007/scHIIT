@@ -1129,7 +1129,7 @@ class BaseTFIdentityPipeline(ABC):
         jsd_thresh_method: str = 'iqr',
         top_n: int = None,
         top_percentile: float = None,
-        use_parallel: bool = True
+        use_parallel: bool = True,
     ) -> List[str]:
         """
         Filter TFs with unique expression pattern using divergence measures.
@@ -1163,7 +1163,7 @@ class BaseTFIdentityPipeline(ABC):
             filtered_scores = {}
             for gene, values in self.results['jsd_scores'].items():
                 signed_specificity = values[2]  # index 2
-                specificity_target = values[5]   # index 5 ← CORRECTED!
+                specificity_target = values[5]   # index 5 CORRECTED!
                 
                 # # Filter for target-specific only
                 # if signed_specificity > 0 and specificity_target > 0.0:
@@ -1651,8 +1651,8 @@ class BaseTFIdentityPipeline(ABC):
             signed_specificity = values[2]
             kl_target_other = values[3]
             kl_other_target = values[4]
-            specificity_target = values[5]  # ← Correct index!
-            specificity_other = values[6]    # ← Correct index!
+            specificity_target = values[5]  # Correct index!
+            specificity_other = values[6]    # Correct index!
             
             # Get mean expression for this gene
             if gene in self.adata.var_names:
@@ -1678,7 +1678,7 @@ class BaseTFIdentityPipeline(ABC):
         
         # Create DataFrame
         df = pd.DataFrame(data)
-        df = df.set_index('gene')
+        # df = df.set_index('gene')
         
         # Add helper column for sorting
         df['abs_specificity'] = df['signed_specificity'].abs()
@@ -1687,4 +1687,265 @@ class BaseTFIdentityPipeline(ABC):
         df = df.sort_values('abs_specificity', ascending=False)
         
         return df
+
+
+
+
+
+# ### Adding multi objective gene ranker 
+# class MultiObjectiveGeneRanker:
+#     """
+#     Rank genes using multi-objective optimization.
+#     """
     
+#     def __init__(self, method='crowding_distance'):
+#         """
+#         Args:
+#             method: 'crowding_distance', 'distance_to_ideal', or 'hypervolume'
+#         """
+#         self.method = method
+    
+#     def rank_genes(
+#         self,
+#         gene_scores_dict: Dict,
+#         adata,
+#         X_target,
+#         top_n: int = None
+#     ) -> List[Tuple[str, float]]:
+#         """
+#         Rank genes using multi-objective optimization.
+        
+#         Returns:
+#             List of (gene, score) tuples sorted by multi-objective rank
+#         """
+#         # Step 1: Compute Pareto frontier
+#         pareto_genes, all_objectives, pareto_mask = compute_pareto_frontier(
+#             gene_scores_dict, adata, X_target
+#         )
+        
+#         # Step 2: Get objectives for Pareto-optimal genes
+#         pareto_objectives = all_objectives[pareto_mask]
+        
+#         # Step 3: Rank within Pareto frontier
+#         if self.method == 'crowding_distance':
+#             scores = crowding_distance(pareto_objectives)
+#         elif self.method == 'distance_to_ideal':
+#             scores = rank_by_distance_to_ideal(pareto_objectives)
+#         elif self.method == 'hypervolume':
+#             ref_point = pareto_objectives.min(axis=0) - 0.1  # Slightly below minimum
+#             scores = hypervolume_contribution(pareto_objectives, ref_point)
+#         else:
+#             raise ValueError(f"Unknown method: {self.method}")
+        
+#         # Step 4: Sort by scores
+#         ranked_genes = sorted(
+#             zip(pareto_genes, scores),
+#             key=lambda x: x[1],
+#             reverse=True
+#         )
+        
+#         if top_n:
+#             ranked_genes = ranked_genes[:top_n]
+        
+#         return ranked_genes
+    
+# import numpy as np
+# from typing import List, Tuple, Dict
+
+# def compute_pareto_frontier(gene_scores_dict: Dict, adata, X_target) -> List[str]:
+#     """
+#     Find Pareto-optimal genes using multi-objective optimization.
+    
+#     Objectives (all to maximize):
+#     1. GJSD magnitude
+#     2. Signed specificity  
+#     3. Specificity to target
+#     4. Expression frequency in target
+#     5. Mean expression in target
+    
+#     Returns:
+#         List of Pareto-optimal gene names
+#     """
+#     genes = []
+#     objectives = []
+    
+#     for gene, scores in gene_scores_dict.items():
+#         if gene not in adata.var_names:
+#             continue
+        
+#         gene_idx = np.where(adata.var_names == gene)[0][0]
+#         target_expr = X_target[:, gene_idx]
+        
+#         # Extract scores
+#         magnitude = scores[0]
+#         signed_specificity = scores[2]
+#         specificity_target = scores[5]
+        
+#         # Compute additional objectives
+#         pct_expressed = (target_expr > 0).sum() / len(target_expr)
+#         mean_expr = target_expr.mean()
+        
+#         # Only consider upregulated genes
+#         if scores[1] <= 0:  # direction
+#             continue
+        
+#         genes.append(gene)
+#         objectives.append([
+#             magnitude,
+#             signed_specificity,
+#             specificity_target,
+#             pct_expressed,
+#             mean_expr
+#         ])
+    
+#     objectives = np.array(objectives)
+    
+#     # Find Pareto frontier
+#     pareto_mask = np.ones(len(genes), dtype=bool)
+    
+#     for i in range(len(genes)):
+#         for j in range(len(genes)):
+#             if i == j:
+#                 continue
+            
+#             # Check if j dominates i
+#             # (j is >= i on all objectives AND > i on at least one)
+#             if (np.all(objectives[j] >= objectives[i]) and 
+#                 np.any(objectives[j] > objectives[i])):
+#                 pareto_mask[i] = False
+#                 break
+    
+#     pareto_genes = [genes[i] for i in range(len(genes)) if pareto_mask[i]]
+    
+#     return pareto_genes, objectives, pareto_mask
+
+# def hypervolume_contribution(objectives: np.ndarray, reference_point: np.ndarray) -> np.ndarray:
+#     """
+#     Compute hypervolume contribution for each solution.
+    
+#     Higher contribution = more important to the Pareto set
+    
+#     Args:
+#         objectives: (n_genes, n_objectives) array
+#         reference_point: Worst acceptable value for each objective
+    
+#     Returns:
+#         Array of hypervolume contributions
+#     """
+#     from scipy.spatial import ConvexHull
+    
+#     n_solutions = objectives.shape[0]
+#     contributions = np.zeros(n_solutions)
+    
+#     # Normalize objectives to [0, 1]
+#     obj_min = objectives.min(axis=0)
+#     obj_max = objectives.max(axis=0)
+#     obj_norm = (objectives - obj_min) / (obj_max - obj_min + 1e-10)
+    
+#     # Reference point (0 on all objectives)
+#     ref = np.zeros(obj_norm.shape[1])
+    
+#     # Compute contribution of each solution
+#     for i in range(n_solutions):
+#         # Hypervolume with all solutions
+#         hv_all = compute_hypervolume_2d(obj_norm, ref)
+        
+#         # Hypervolume without solution i
+#         mask = np.ones(n_solutions, dtype=bool)
+#         mask[i] = False
+#         hv_without = compute_hypervolume_2d(obj_norm[mask], ref)
+        
+#         # Contribution = difference
+#         contributions[i] = hv_all - hv_without
+    
+#     return contributions
+
+
+# def compute_hypervolume_2d(points: np.ndarray, reference: np.ndarray) -> float:
+#     """
+#     Compute 2D hypervolume (area under Pareto frontier).
+#     For >2D, use pymoo library.
+#     """
+#     if points.shape[1] == 2:
+#         # Sort by first objective
+#         sorted_points = points[points[:, 0].argsort()]
+        
+#         volume = 0.0
+#         for i in range(len(sorted_points)):
+#             if i == 0:
+#                 width = sorted_points[i, 0] - reference[0]
+#             else:
+#                 width = sorted_points[i, 0] - sorted_points[i-1, 0]
+            
+#             height = sorted_points[i, 1] - reference[1]
+#             volume += width * height
+        
+#         return volume
+#     else:
+#         # For >2D, use pymoo
+#         from pymoo.indicators.hv import HV
+#         ind = HV(ref_point=reference)
+#         return ind(points)
+# def rank_by_distance_to_ideal(objectives: np.ndarray) -> np.ndarray:
+#     """
+#     Rank solutions by distance to ideal point.
+    
+#     Ideal point = best value on each objective (utopia point)
+    
+#     Returns:
+#         Ranking scores (higher = closer to ideal)
+#     """
+#     # Normalize objectives
+#     obj_min = objectives.min(axis=0)
+#     obj_max = objectives.max(axis=0)
+#     obj_norm = (objectives - obj_min) / (obj_max - obj_min + 1e-10)
+    
+#     # Ideal point (1 on all objectives)
+#     ideal = np.ones(obj_norm.shape[1])
+    
+#     # Euclidean distance to ideal
+#     distances = np.linalg.norm(obj_norm - ideal, axis=1)
+    
+#     # Convert to scores (smaller distance = higher score)
+#     scores = 1.0 / (distances + 1e-10)
+    
+#     return scores
+
+# def crowding_distance(objectives: np.ndarray) -> np.ndarray:
+#     """
+#     Compute crowding distance for each solution.
+    
+#     Favors solutions in less crowded regions of objective space.
+#     Used in NSGA-II algorithm.
+    
+#     Returns:
+#         Crowding distances (higher = more isolated, more important)
+#     """
+#     n_solutions = objectives.shape[0]
+#     n_objectives = objectives.shape[1]
+    
+#     distances = np.zeros(n_solutions)
+    
+#     for m in range(n_objectives):
+#         # Sort by objective m
+#         sorted_idx = np.argsort(objectives[:, m])
+        
+#         # Boundary solutions get infinite distance
+#         distances[sorted_idx[0]] = np.inf
+#         distances[sorted_idx[-1]] = np.inf
+        
+#         # Range of objective m
+#         obj_range = objectives[sorted_idx[-1], m] - objectives[sorted_idx[0], m]
+        
+#         if obj_range == 0:
+#             continue
+        
+#         # Crowding distance for interior solutions
+#         for i in range(1, n_solutions - 1):
+#             idx = sorted_idx[i]
+#             idx_prev = sorted_idx[i - 1]
+#             idx_next = sorted_idx[i + 1]
+            
+#             distances[idx] += (objectives[idx_next, m] - objectives[idx_prev, m]) / obj_range
+    
+#     return distances
