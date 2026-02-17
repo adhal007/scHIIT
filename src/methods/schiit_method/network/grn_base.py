@@ -78,14 +78,13 @@ class StageIIICoreIdentifier:
                 print(f"  Loading from {self.chipseq_file}...")
             
             chipseq = pd.read_csv(self.chipseq_file, sep='\t')
-            
+
             if 'TF' in chipseq.columns and 'Gene' in chipseq.columns:
                 self.pkn = chipseq[['TF', 'Gene']].copy()
                 self.pkn.columns = ['source', 'target']
             else:
                 self.pkn = chipseq[['source', 'target']].copy()
-            
-            self.pkn = self.pkn.drop_duplicates()
+
             self.pkn['evidence'] = 'chip'
         # CollecTRI
         if self.use_collectri:
@@ -115,8 +114,10 @@ class StageIIICoreIdentifier:
                     print(f"  CollecTRI edges: {len(pkn_collectri)}")
 
                 print('\nMerging CHIP and Collectri')
-                self.pkn = pd.concat([self.pkn, pkn_collectri], axis=1)
-
+                self.pkn = pd.concat([self.pkn, pkn_collectri], axis=0)
+        
+        self.pkn = self.pkn.drop_duplicates(subset=['source', 'target']).reset_index(drop=True)
+        
         if self.verbose:
             print(f"  Total PKN edges: {len(self.pkn)}")
             print(f"  Identity TFs: {len(self.identity_tfs)}")
